@@ -263,9 +263,14 @@ function migrateOldState(s) {
       lastSeenPrice: Number(s.lastSeenPrice || 0),
       lastSeenPriceMs: Number(s.lastSeenPriceMs || 0),
       pausedUntilMs: Number(s.pausedUntilMs || 0),
+      rev: Number(s.rev || 0),
     };
   }
-  return s;
+  const src = s || {};
+  return {
+    ...src,
+    rev: Number(src.rev || 0),
+  };
 }
 
 async function loadState(env, symbol) {
@@ -281,19 +286,28 @@ async function loadState(env, symbol) {
       lastSeenPrice: 0,
       lastSeenPriceMs: 0,
       pausedUntilMs: 0,
+      rev: 0,
     };
   }
   return migrateOldState(snap.data());
 }
 
 async function saveState(env, symbol, state) {
+  const expectedRev = Number(state?.rev || 0);
   const ref = db.collection(ENV.FIRESTORE_COLLECTION).doc(docIdFor(env, symbol));
-  await ref.set({
-    ...state,
-    env,
-    symbol,
-    updatedAtMs: nowMs(),
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const currentRev = snap.exists ? Number((snap.data() || {}).rev || 0) : 0;
+    if (currentRev !== expectedRev) throw new Error("state revision conflict");
+    tx.set(ref, {
+      ...state,
+      env,
+      symbol,
+      rev: expectedRev + 1,
+      updatedAtMs: nowMs(),
+    });
   });
+  state.rev = expectedRev + 1;
 }
 
 
@@ -1404,7 +1418,6 @@ app.listen(ENV.PORT, "0.0.0.0", () => {
 // Safety logs (Cloud Run)
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
-
 
 
 
