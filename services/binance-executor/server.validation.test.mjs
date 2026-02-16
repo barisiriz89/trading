@@ -76,12 +76,23 @@ async function postExecute(body) {
   return { status: r.status, body: await r.json() };
 }
 
+async function getHealthz() {
+  const r = await fetch(`${BASE}/healthz`);
+  return { status: r.status, body: await r.json() };
+}
+
 test.before(async () => {
   await startServer();
 });
 
 test.after(async () => {
   await stopServer();
+});
+
+test("healthz returns 200 and ok", async () => {
+  const res = await getHealthz();
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
 });
 
 test("invalid mode returns 400 and error", async () => {

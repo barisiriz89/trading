@@ -6,7 +6,12 @@ import crypto from "crypto";
 import { Firestore } from "@google-cloud/firestore";
 
 const app = express();
-app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
+function healthz(_req, res) {
+  res.status(200).json({ ok: true });
+}
+app.get("/healthz", healthz);
+app.get("/healthz/", healthz);
+app.get("/health", healthz);
 
 app.set("trust proxy", true);
 app.use(express.json({ limit: "256kb" }));
@@ -1583,7 +1588,6 @@ export const __test = {
     memIdemDocs.clear();
   },
 };
-
 
 
 
