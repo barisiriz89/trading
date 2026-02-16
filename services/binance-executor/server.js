@@ -372,6 +372,23 @@ function makeIdempotencyKey({ env, mode, symbol, side, orderType, notionalUSDT, 
   return `hash:${crypto.createHash("sha256").update(base).digest("hex")}`;
 }
 
+function logIdempotencyStatus({ env, symbol, clientOrderId, key, status, phase, rid, reason }) {
+  console.log(
+    "IDEMPOTENCY_STATUS:",
+    JSON.stringify({
+      env: env || "",
+      symbol: symbol || "",
+      clientOrderId: clientOrderId || "",
+      key: key || "",
+      status: status || "",
+      phase: phase || "",
+      rid: rid || "",
+      reason: reason || "",
+      ts: nowMs(),
+    })
+  );
+}
+
 async function claimIdempotency(params) {
   const key = makeIdempotencyKey(params);
   const createdAtMs = nowMs();
@@ -392,10 +409,17 @@ async function claimIdempotency(params) {
         clientOrderId: params.clientOrderId || null,
         rid: params.rid,
       });
+      logIdempotencyStatus({ env: params.env, symbol: params.symbol, clientOrderId: params.clientOrderId, key, status: "IN_PROGRESS", phase: "claim:create", rid: params.rid });
       return { key, status: "CLAIMED" };
     }
-    if (existing.status === "SUCCEEDED") return { key, status: "SUCCEEDED", summary: existing.summary || null };
-    if (existing.status === "IN_PROGRESS") return { key, status: "IN_PROGRESS" };
+    if (existing.status === "SUCCEEDED") {
+      logIdempotencyStatus({ env: params.env, symbol: params.symbol, clientOrderId: params.clientOrderId, key, status: "SUCCEEDED", phase: "claim:duplicate", rid: params.rid });
+      return { key, status: "SUCCEEDED", summary: existing.summary || null };
+    }
+    if (existing.status === "IN_PROGRESS") {
+      logIdempotencyStatus({ env: params.env, symbol: params.symbol, clientOrderId: params.clientOrderId, key, status: "IN_PROGRESS", phase: "claim:duplicate", rid: params.rid });
+      return { key, status: "IN_PROGRESS" };
+    }
     memIdemDocs.set(key, {
       ...existing,
       status: "IN_PROGRESS",
@@ -403,6 +427,7 @@ async function claimIdempotency(params) {
       updatedAtMs: createdAtMs,
       rid: params.rid,
     });
+    logIdempotencyStatus({ env: params.env, symbol: params.symbol, clientOrderId: params.clientOrderId, key, status: "IN_PROGRESS", phase: "claim:reopen", rid: params.rid });
     return { key, status: "CLAIMED" };
   }
   const ref = db.collection(ENV.FIRESTORE_IDEMPOTENCY_COLLECTION).doc(key);
@@ -425,25 +450,33 @@ async function claimIdempotency(params) {
         rid: params.rid,
       });
       out = { key, status: "CLAIMED" };
+      logIdempotencyStatus({ env: params.env, symbol: params.symbol, clientOrderId: params.clientOrderId, key, status: "IN_PROGRESS", phase: "claim:create", rid: params.rid });
       return;
     }
     const data = snap.data() || {};
     if (data.status === "SUCCEEDED") {
       out = { key, status: "SUCCEEDED", summary: data.summary || null };
+      logIdempotencyStatus({ env: params.env, symbol: params.symbol, clientOrderId: params.clientOrderId, key, status: "SUCCEEDED", phase: "claim:duplicate", rid: params.rid });
       return;
     }
     if (data.status === "IN_PROGRESS") {
       out = { key, status: "IN_PROGRESS" };
+      logIdempotencyStatus({ env: params.env, symbol: params.symbol, clientOrderId: params.clientOrderId, key, status: "IN_PROGRESS", phase: "claim:duplicate", rid: params.rid });
       return;
     }
     tx.update(ref, { status: "IN_PROGRESS", summary: null, updatedAtMs: createdAtMs, rid: params.rid });
     out = { key, status: "CLAIMED" };
+    logIdempotencyStatus({ env: params.env, symbol: params.symbol, clientOrderId: params.clientOrderId, key, status: "IN_PROGRESS", phase: "claim:reopen", rid: params.rid });
   });
   return out;
 }
 
 async function finalizeIdempotency(key, status, summary) {
   if (!key) return;
+  const parts = String(key).split(":");
+  const env = parts.length > 1 ? parts[1] : "";
+  const symbol = parts.length > 2 ? parts[2] : "";
+  const clientOrderId = parts.length > 3 ? parts.slice(3).join(":") : "";
   if (USE_MEMORY_BACKEND) {
     const existing = memIdemDocs.get(key);
     if (!existing) return;
@@ -453,10 +486,12 @@ async function finalizeIdempotency(key, status, summary) {
       summary: summary || null,
       updatedAtMs: nowMs(),
     });
+    logIdempotencyStatus({ env: existing.env || env, symbol: existing.symbol || symbol, clientOrderId: existing.clientOrderId || clientOrderId, key, status, phase: "finalize", rid: existing.rid || "", reason: summary?.reason || "" });
     return;
   }
   const ref = db.collection(ENV.FIRESTORE_IDEMPOTENCY_COLLECTION).doc(key);
   await ref.set({ status, summary: summary || null, updatedAtMs: nowMs() }, { merge: true });
+  logIdempotencyStatus({ env, symbol, clientOrderId, key, status, phase: "finalize", reason: summary?.reason || "" });
 }
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Binance helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1588,7 +1623,6 @@ export const __test = {
     memIdemDocs.clear();
   },
 };
-
 
 
 
