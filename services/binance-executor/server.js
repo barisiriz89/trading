@@ -1,10 +1,9 @@
-// server.js (ESM)
+﻿// server.js (ESM)
 // Requires: package.json -> { "type": "module" }, Node >= 18
 
 import express from "express";
 import crypto from "crypto";
 import { Firestore } from "@google-cloud/firestore";
-import { parseAllowlist, isSymbolAllowed as isAllowed } from "@baris/trading-core";
 
 const app = express();
 app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
@@ -12,7 +11,16 @@ app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
 app.set("trust proxy", true);
 app.use(express.json({ limit: "256kb" }));
 
-// ───────────────────────── Env ─────────────────────────
+function parseAllowlist(raw) {
+  return String(raw || "").split(",").map((x) => x.trim().toUpperCase()).filter(Boolean);
+}
+
+function isAllowed(sym, allowlist) {
+  const s = String(sym || "").toUpperCase();
+  return Array.isArray(allowlist) && allowlist.includes(s);
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Env â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const ENV = {
   PORT: parseInt(process.env.PORT || "8080", 10),
 
@@ -79,7 +87,8 @@ const ENV = {
 
   // Firestore
   FIRESTORE_COLLECTION: process.env.FIRESTORE_COLLECTION || "positions",
-
+  FIRESTORE_IDEMPOTENCY_COLLECTION: process.env.FIRESTORE_IDEMPOTENCY_COLLECTION || "executor_idempotency",
+  IDEMPOTENCY_TTL_MS: parseInt(process.env.IDEMPOTENCY_TTL_MS || "86400000", 10), // 24h
   // Binance endpoints
   BINANCE_MAINNET_BASE: process.env.BINANCE_MAINNET_BASE || "https://api-gcp.binance.com",
   BINANCE_TESTNET_BASE: process.env.BINANCE_TESTNET_BASE || "https://testnet.binance.vision",
@@ -95,18 +104,36 @@ const ENV = {
   // anti-spam / perf
   PRICE_CACHE_MS: parseInt(process.env.PRICE_CACHE_MS || "2000", 10),
   FETCH_TIMEOUT_MS: parseInt(process.env.FETCH_TIMEOUT_MS || "8000", 10),
+
+  // Profile toggles
+  CANARY: (process.env.CANARY || "false").toLowerCase() === "true",
+  STRATEGY_PROFILE: (process.env.STRATEGY_PROFILE || "").toLowerCase(),
 };
 
 const feeRate = ENV.TAKER_FEE_BPS / 10000;
 
-// ───────────────────────── Helpers ─────────────────────────
+if (ENV.CANARY || ENV.STRATEGY_PROFILE === "canary") {
+  ENV.SCALP_MAX_OPEN = 1;
+  ENV.DCA_MAX = 0;
+  ENV.MAX_TOTAL_EXPOSURE_USDT = 25;
+  ENV.MAX_NOTIONAL_USDT = 15;
+  console.log("PROFILE OVERRIDE:", JSON.stringify({ profile: "canary", SCALP_MAX_OPEN: ENV.SCALP_MAX_OPEN, DCA_MAX: ENV.DCA_MAX, MAX_TOTAL_EXPOSURE_USDT: ENV.MAX_TOTAL_EXPOSURE_USDT, MAX_NOTIONAL_USDT: ENV.MAX_NOTIONAL_USDT }));
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function nowMs() {
   return Date.now();
 }
 
 function json(res, status, obj) {
+  const payload = (obj && typeof obj === "object") ? obj : {};
+  const ctx = res?.locals?.executeLogContext;
+  if (ctx) {
+    const execSide = typeof payload.side === "string" ? String(payload.side).toUpperCase() : (ctx.reqSide || "");
+    console.log("EXECUTE OUT:", JSON.stringify({ rid: ctx.rid || payload.rid || "", clientOrderId: ctx.clientOrderId || "", reqSide: ctx.reqSide || "", execSide, strategy: ctx.strategy || payload.strategy || "", env: ctx.env || payload.env || "", symbol: ctx.symbol || payload.symbol || "", mode: ctx.mode || payload.mode || "", binanceStatus: payload.binanceStatus ?? null, endpoint: payload.endpoint ?? null, status, ok: Boolean(payload.ok) }));
+  }
   res.status(status).setHeader("Content-Type", "application/json");
-  res.send(JSON.stringify(obj));
+  res.send(JSON.stringify(payload));
 }
 
 function rid() {
@@ -189,7 +216,7 @@ function normalizeStrategy(s) {
   return (["core", "auto", "scalp"].includes(raw) ? raw : "core");
 }
 
-// ───────────────────────── Firestore state ─────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Firestore state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const db = new Firestore();
 
 /**
@@ -257,12 +284,29 @@ async function loadState(env, symbol) {
   return migrateOldState(snap.data());
 }
 
-async function saveState(env, symbol, state) {
-  const ref = db.collection(ENV.FIRESTORE_COLLECTION).doc(docIdFor(env, symbol));
-  await ref.set(state, { merge: true });
+
+
+function makeIdempotencyKey({ env, mode, symbol, side, orderType, notionalUSDT, clientOrderId, ts }) {
+  if (clientOrderId && String(clientOrderId).trim()) return `cid:${env}:${symbol}:${String(clientOrderId).trim()}`;
+  const base = JSON.stringify({ env, mode, symbol, side, orderType, notionalUSDT, ts: ts || Math.floor(nowMs() / 60000) });
+  return `hash:${crypto.createHash("sha256").update(base).digest("hex")}`;
 }
 
-// ───────────────────────── Binance helpers ─────────────────────────
+async function claimIdempotency(params) {
+  const key = makeIdempotencyKey(params);
+  const ref = db.collection(ENV.FIRESTORE_IDEMPOTENCY_COLLECTION).doc(key);
+  const createdAtMs = nowMs();
+  let claimed = false;
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (snap.exists) return;
+    tx.create(ref, { key, createdAtMs, expiresAtMs: createdAtMs + ENV.IDEMPOTENCY_TTL_MS, env: params.env, mode: params.mode, symbol: params.symbol, side: params.side, clientOrderId: params.clientOrderId || null, rid: params.rid });
+    claimed = true;
+  });
+  return { claimed, key };
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Binance helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function pickBinanceCreds(env) {
   if (env === "testnet") {
     return {
@@ -326,7 +370,7 @@ async function binanceOrder({ env, mode, symbol, side, notionalUSDT, quantity, c
   return { ok: r.ok, status: r.status, endpoint, base, body };
 }
 
-// ───────────────────────── Fill parsing (REAL qty/cost/fees) ─────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Fill parsing (REAL qty/cost/fees) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function parseFillSummary(orderBody, fallbackPrice) {
   // Works for both BUY and SELL MARKET orders (mainnet response)
   // Returns: { executedQty, quoteQty, avgFillPrice, feeUSDT, feeBaseQty }
@@ -377,7 +421,7 @@ function parseFillSummary(orderBody, fallbackPrice) {
   return { executedQty, quoteQty, avgFillPrice, feeUSDT: 0, feeBaseQty: 0 };
 }
 
-// ───────────────────────── Strategy helpers ─────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Strategy helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function totalExposureUSDT(state) {
   const core = state.core?.costUSDT || 0;
   const cycles = (state.cycles || [])
@@ -505,7 +549,7 @@ function newCycleId() {
   return `c_${nowMs()}_${crypto.randomBytes(3).toString("hex")}`;
 }
 
-// ───────────────────────── Request ID middleware ─────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Request ID middleware â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.use((req, _res, next) => {
   req.rid = req.rid || rid();
   next();
@@ -513,7 +557,7 @@ app.use((req, _res, next) => {
 
 app.get("/", (req, res) => json(res, 200, { ok: true, service: "binance-executor", ts: nowMs(), rid: req.rid }));
 
-// ───────────────────────── Routes ─────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.post("/execute", async (req, res) => {
   const requestId = req.rid || rid();
 
@@ -529,6 +573,7 @@ app.post("/execute", async (req, res) => {
       notionalUSDT,
       clientOrderId,
       strategy,
+          ts,
     } = req.body || {};
 
     const STRATEGY = normalizeStrategy(strategy);
@@ -562,14 +607,25 @@ app.post("/execute", async (req, res) => {
     }
 
     const actionSide = String(side || "").toUpperCase();
-    if (!["BUY", "SELL", "TICK"].includes(actionSide)) {
-      return json(res, 400, { ok: false, error: "side must be BUY or SELL or TICK", rid: requestId });
+    
+
+    res.locals.executeLogContext = { rid: requestId, clientOrderId: String(clientOrderId || ''), reqSide: actionSide, strategy: STRATEGY, env, symbol: String(binanceSymbol || ''), mode };
+
+    const idem = await claimIdempotency({ env, mode, symbol: binanceSymbol, side: actionSide, orderType: String(orderType).toUpperCase(), notionalUSDT: Number(notionalUSDT || 0), clientOrderId, ts, rid: requestId });
+    if (!idem.claimed) {
+      return json(res, 200, { ok: true, strategy: STRATEGY, env, mode, symbol: binanceSymbol, side: actionSide, skipped: 'duplicate request', dedupeKey: idem.key, rid: requestId });
     }
 
-    const t = nowMs();
-    const state = await loadState(env, binanceSymbol);
+    
+    const persistState = async () => {
+      if (mode === 'test') {
+        console.log('STATE_WRITE_SKIPPED:', JSON.stringify({ rid: requestId, env, mode, symbol: binanceSymbol, strategy: STRATEGY, reason: 'mode=test' }));
+        return;
+      }
+      await persistState();
+    };
 
-    // ───────────────────────── Price snapshot (with cache) ─────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Price snapshot (with cache) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const { base } = pickBinanceCreds(env);
 
     let currentPrice = 0;
@@ -641,10 +697,10 @@ app.post("/execute", async (req, res) => {
       };
     }
 
-    // ───────────────────────── TICK ─────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ TICK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if (actionSide === "TICK") {
       if (ENV.TP_MODE === "market_on_sell_signal") {
-        await saveState(env, binanceSymbol, state);
+        await persistState();
         return json(res, 200, {
           ok: true,
           strategy: STRATEGY,
@@ -659,7 +715,7 @@ app.post("/execute", async (req, res) => {
       if (bestCycle && shouldExitByProfitLock(bestCycle, currentPrice)) {
         const r = await marketSellLeg(bestCycle.qty);
         if (!r.ok) {
-          await saveState(env, binanceSymbol, state);
+          await persistState();
           return json(res, 502, {
             ok: false,
             error: r.order ? "binance sell failed" : "sell skipped",
@@ -674,7 +730,7 @@ app.post("/execute", async (req, res) => {
 
         // NEVER accept sell if realized net < target (safety, even if estimate said ok)
         if (realizedNet < ENV.PROFIT_LOCK_NET_USDT) {
-          // We already sold on Binance — so we must reflect state as closed, but we can warn loudly.
+          // We already sold on Binance â€” so we must reflect state as closed, but we can warn loudly.
           // (In practice, this should almost never happen with fill-based state and conservative trailing.)
           console.warn("WARN: realizedNet below target after SELL:", { rid: requestId, realizedNet });
         }
@@ -693,7 +749,7 @@ app.post("/execute", async (req, res) => {
 
         state.lastActionMs = t;
 
-        await saveState(env, binanceSymbol, state);
+        await persistState();
 
         return json(res, 200, {
           ok: true,
@@ -720,7 +776,7 @@ app.post("/execute", async (req, res) => {
       if (state.core?.qty > 0 && shouldExitByProfitLock(state.core, currentPrice)) {
         const r = await marketSellLeg(state.core.qty);
         if (!r.ok) {
-          await saveState(env, binanceSymbol, state);
+          await persistState();
           return json(res, 502, {
             ok: false,
             error: r.order ? "binance sell failed" : "sell skipped",
@@ -742,7 +798,7 @@ app.post("/execute", async (req, res) => {
 
         state.lastActionMs = t;
 
-        await saveState(env, binanceSymbol, state);
+        await persistState();
 
         return json(res, 200, {
           ok: true,
@@ -766,7 +822,7 @@ app.post("/execute", async (req, res) => {
         });
       }
 
-      await saveState(env, binanceSymbol, state);
+      await persistState();
       return json(res, 200, {
         ok: true,
         strategy: STRATEGY,
@@ -776,7 +832,7 @@ app.post("/execute", async (req, res) => {
       });
     }
 
-    // ───────────────────────── SELL signal ─────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ SELL signal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if (actionSide === "SELL") {
       // Hard rule: NEVER sell unless estimated net >= target.
       // (Realized net is computed after actual sell)
@@ -784,7 +840,7 @@ app.post("/execute", async (req, res) => {
       if (bestCycle && netProfitUSDT(bestCycle, currentPrice) >= ENV.PROFIT_LOCK_NET_USDT) {
         const r = await marketSellLeg(bestCycle.qty);
         if (!r.ok) {
-          await saveState(env, binanceSymbol, state);
+          await persistState();
           return json(res, 502, {
             ok: false,
             error: r.order ? "binance sell failed" : "sell skipped",
@@ -807,7 +863,7 @@ app.post("/execute", async (req, res) => {
 
         state.lastActionMs = t;
 
-        await saveState(env, binanceSymbol, state);
+        await persistState();
 
         return json(res, 200, {
           ok: true,
@@ -834,7 +890,7 @@ app.post("/execute", async (req, res) => {
       if (state.core?.qty > 0 && netProfitUSDT(state.core, currentPrice) >= ENV.PROFIT_LOCK_NET_USDT) {
         const r = await marketSellLeg(state.core.qty);
         if (!r.ok) {
-          await saveState(env, binanceSymbol, state);
+          await persistState();
           return json(res, 502, {
             ok: false,
             error: r.order ? "binance sell failed" : "sell skipped",
@@ -851,7 +907,7 @@ app.post("/execute", async (req, res) => {
 
         state.lastActionMs = t;
 
-        await saveState(env, binanceSymbol, state);
+        await persistState();
 
         return json(res, 200, {
           ok: true,
@@ -875,7 +931,7 @@ app.post("/execute", async (req, res) => {
         });
       }
 
-      await saveState(env, binanceSymbol, state);
+      await persistState();
       return json(res, 200, {
         ok: true,
         strategy: STRATEGY,
@@ -886,7 +942,7 @@ app.post("/execute", async (req, res) => {
       });
     }
 
-    // ───────────────────────── BUY signal ─────────────────────────
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ BUY signal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if (actionSide === "BUY") {
       // Cooldown ONLY for BUY
       if (state.lastActionMs && t - state.lastActionMs < ENV.COOLDOWN_MS) {
@@ -900,7 +956,7 @@ app.post("/execute", async (req, res) => {
       }
 
       if (paused) {
-        await saveState(env, binanceSymbol, state);
+        await persistState();
         return json(res, 200, {
           ok: true,
           strategy: STRATEGY,
@@ -920,7 +976,7 @@ app.post("/execute", async (req, res) => {
         const desiredNotional = clampNotional(baseOrder, ENV.BASE_ORDER_USDT);
 
         if (exposure + desiredNotional > ENV.MAX_TOTAL_EXPOSURE_USDT) {
-          await saveState(env, binanceSymbol, state);
+          await persistState();
           return json(res, 200, {
             ok: true,
             strategy: STRATEGY,
@@ -941,7 +997,7 @@ app.post("/execute", async (req, res) => {
         });
 
         if (!order.ok) {
-          await saveState(env, binanceSymbol, state);
+          await persistState();
           return json(res, 502, {
             ok: false,
             error: "binance buy failed",
@@ -975,7 +1031,7 @@ app.post("/execute", async (req, res) => {
 
         state.lastActionMs = t;
 
-        await saveState(env, binanceSymbol, state);
+        await persistState();
 
         return json(res, 200, {
           ok: true,
@@ -1013,7 +1069,7 @@ app.post("/execute", async (req, res) => {
         const desiredNotional = clampNotional(baseOrder, ENV.BASE_ORDER_USDT);
 
         if (exposure + desiredNotional > ENV.MAX_TOTAL_EXPOSURE_USDT) {
-          await saveState(env, binanceSymbol, state);
+          await persistState();
           return json(res, 200, {
             ok: true,
             strategy: STRATEGY,
@@ -1034,7 +1090,7 @@ app.post("/execute", async (req, res) => {
         });
 
         if (!order.ok) {
-          await saveState(env, binanceSymbol, state);
+          await persistState();
           return json(res, 502, {
             ok: false,
             error: "binance buy failed",
@@ -1063,7 +1119,7 @@ app.post("/execute", async (req, res) => {
 
         state.lastActionMs = t;
 
-        await saveState(env, binanceSymbol, state);
+        await persistState();
 
         return json(res, 200, {
           ok: true,
@@ -1099,7 +1155,7 @@ app.post("/execute", async (req, res) => {
 
       // 2.5) core exists but no DCA -> if strategy core-only, do NOT scalp
       if (STRATEGY === "core") {
-        await saveState(env, binanceSymbol, state);
+        await persistState();
         return json(res, 200, {
           ok: true,
           strategy: STRATEGY,
@@ -1112,7 +1168,7 @@ app.post("/execute", async (req, res) => {
 
       // 3) scalp path (only if strategy auto/scalp)
       if (!ENV.ALLOW_SCALP) {
-        await saveState(env, binanceSymbol, state);
+        await persistState();
         return json(res, 200, {
           ok: true,
           strategy: STRATEGY,
@@ -1130,7 +1186,7 @@ app.post("/execute", async (req, res) => {
         const desiredNotional = clampNotional(notionalUSDT, ENV.SCALP_ORDER_USDT);
 
         if (exposure + desiredNotional > ENV.MAX_TOTAL_EXPOSURE_USDT) {
-          await saveState(env, binanceSymbol, state);
+          await persistState();
           return json(res, 200, {
             ok: true,
             strategy: STRATEGY,
@@ -1151,7 +1207,7 @@ app.post("/execute", async (req, res) => {
         });
 
         if (!order.ok) {
-          await saveState(env, binanceSymbol, state);
+          await persistState();
           return json(res, 502, {
             ok: false,
             error: "binance buy failed",
@@ -1180,7 +1236,7 @@ app.post("/execute", async (req, res) => {
 
         state.lastActionMs = t;
 
-        await saveState(env, binanceSymbol, state);
+        await persistState();
 
         return json(res, 200, {
           ok: true,
@@ -1211,12 +1267,12 @@ app.post("/execute", async (req, res) => {
 
       // 3b) open new scalp cycle
       if (!ENV.ALLOW_REBUY) {
-        await saveState(env, binanceSymbol, state);
+        await persistState();
         return json(res, 200, { ok: true, strategy: STRATEGY, skipped: "rebuy disabled (ALLOW_REBUY=false)", price: currentPrice, rid: requestId });
       }
 
       if (openCycles.length >= ENV.SCALP_MAX_OPEN) {
-        await saveState(env, binanceSymbol, state);
+        await persistState();
         return json(res, 200, {
           ok: true,
           strategy: STRATEGY,
@@ -1230,7 +1286,7 @@ app.post("/execute", async (req, res) => {
 
       const desiredNotional = clampNotional(notionalUSDT, ENV.SCALP_ORDER_USDT);
       if (exposure + desiredNotional > ENV.MAX_TOTAL_EXPOSURE_USDT) {
-        await saveState(env, binanceSymbol, state);
+        await persistState();
         return json(res, 200, {
           ok: true,
           strategy: STRATEGY,
@@ -1251,7 +1307,7 @@ app.post("/execute", async (req, res) => {
       });
 
       if (!order.ok) {
-        await saveState(env, binanceSymbol, state);
+        await persistState();
         return json(res, 502, {
           ok: false,
           error: "binance buy failed",
@@ -1282,7 +1338,7 @@ app.post("/execute", async (req, res) => {
 
       state.lastActionMs = t;
 
-      await saveState(env, binanceSymbol, state);
+      await persistState();
 
       return json(res, 200, {
         ok: true,
@@ -1306,7 +1362,7 @@ app.post("/execute", async (req, res) => {
     }
 
     // should never reach
-    await saveState(env, binanceSymbol, state);
+    await persistState();
     return json(res, 200, { ok: true, strategy: normalizeStrategy(strategy), skipped: "no-op", rid: requestId });
   } catch (e) {
     return json(res, 500, { ok: false, error: String(e?.message || e), rid: requestId });
@@ -1321,3 +1377,11 @@ app.listen(ENV.PORT, "0.0.0.0", () => {
 // Safety logs (Cloud Run)
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+
+
+
+
+
+
+
+
