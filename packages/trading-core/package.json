@@ -1,0 +1,17 @@
+{
+  "name": "@baris/trading-core",
+  "version": "0.0.1",
+  "description": "",
+  "main": "./src/index.js",
+  "scripts": {
+    "test": "node -e \"console.log('core ok')\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "exports": {
+    "./*": "./src/*",
+    ".": "./src/index.js"
+  }
+}

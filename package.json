@@ -1,0 +1,13 @@
+{
+  "name": "trading-platform",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "install:all": "npm install",
+    "test": "npm --workspaces --if-present run test",
+    "lint": "npm --workspaces --if-present run lint"
+  }
+}
