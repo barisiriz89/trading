@@ -81,6 +81,16 @@ async function getHealthz() {
   return { status: r.status, body: await r.json() };
 }
 
+async function getHealthzSlash() {
+  const r = await fetch(`${BASE}/healthz/`);
+  return { status: r.status, body: await r.json() };
+}
+
+async function headHealthz(pathname) {
+  const r = await fetch(`${BASE}${pathname}`, { method: "HEAD" });
+  return { status: r.status, xPoweredBy: r.headers.get("x-powered-by") || "" };
+}
+
 test.before(async () => {
   await startServer();
 });
@@ -93,6 +103,21 @@ test("healthz returns 200 and ok", async () => {
   const res = await getHealthz();
   assert.equal(res.status, 200);
   assert.equal(res.body.ok, true);
+});
+
+test("healthz slash returns 200 and ok", async () => {
+  const res = await getHealthzSlash();
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+});
+
+test("healthz HEAD works for both slash and non-slash", async () => {
+  const a = await headHealthz("/healthz");
+  const b = await headHealthz("/healthz/");
+  assert.equal(a.status, 200);
+  assert.equal(b.status, 200);
+  assert.equal(Boolean(a.xPoweredBy), true);
+  assert.equal(Boolean(b.xPoweredBy), true);
 });
 
 test("invalid mode returns 400 and error", async () => {

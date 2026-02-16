@@ -6,11 +6,14 @@ import crypto from "crypto";
 import { Firestore } from "@google-cloud/firestore";
 
 const app = express();
+app.disable("strict routing");
 function healthz(_req, res) {
   res.status(200).json({ ok: true });
 }
 app.get("/healthz", healthz);
 app.get("/healthz/", healthz);
+app.head("/healthz", healthz);
+app.head("/healthz/", healthz);
 app.get("/health", healthz);
 
 app.set("trust proxy", true);
@@ -1623,6 +1626,5 @@ export const __test = {
     memIdemDocs.clear();
   },
 };
-
 
 
