@@ -109,6 +109,7 @@ const ENV = {
   CANARY: (process.env.CANARY || "false").toLowerCase() === "true",
   STRATEGY_PROFILE: (process.env.STRATEGY_PROFILE || "").toLowerCase(),
 };
+const USE_MEMORY_BACKEND = (process.env.EXECUTOR_STATE_BACKEND || "").toLowerCase() === "memory";
 
 const feeRate = ENV.TAKER_FEE_BPS / 10000;
 
@@ -232,7 +233,9 @@ function normalizeStrategy(s) {
 }
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Firestore state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-const db = new Firestore();
+const db = USE_MEMORY_BACKEND ? null : new Firestore();
+const memStateDocs = new Map();
+const memIdemDocs = new Map();
 
 /**
  * State shape:
@@ -287,6 +290,23 @@ function migrateOldState(s) {
 }
 
 async function loadState(env, symbol) {
+  if (USE_MEMORY_BACKEND) {
+    const raw = memStateDocs.get(docIdFor(env, symbol));
+    if (!raw) {
+      return {
+        env,
+        symbol,
+        core: emptyLeg(),
+        cycles: [],
+        lastActionMs: 0,
+        lastSeenPrice: 0,
+        lastSeenPriceMs: 0,
+        pausedUntilMs: 0,
+        rev: 0,
+      };
+    }
+    return migrateOldState(raw);
+  }
   const ref = db.collection(ENV.FIRESTORE_COLLECTION).doc(docIdFor(env, symbol));
   const snap = await ref.get();
   if (!snap.exists) {
@@ -307,6 +327,22 @@ async function loadState(env, symbol) {
 
 async function saveState(env, symbol, state) {
   const expectedRev = Number(state?.rev || 0);
+  const id = docIdFor(env, symbol);
+  if (USE_MEMORY_BACKEND) {
+    const current = memStateDocs.get(id);
+    const currentRev = Number(current?.rev || 0);
+    if (currentRev !== expectedRev) throw new Error("state revision conflict");
+    const next = {
+      ...state,
+      env,
+      symbol,
+      rev: expectedRev + 1,
+      updatedAtMs: nowMs(),
+    };
+    memStateDocs.set(id, next);
+    state.rev = next.rev;
+    return;
+  }
   const ref = db.collection(ENV.FIRESTORE_COLLECTION).doc(docIdFor(env, symbol));
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
@@ -333,8 +369,38 @@ function makeIdempotencyKey({ env, mode, symbol, side, orderType, notionalUSDT, 
 
 async function claimIdempotency(params) {
   const key = makeIdempotencyKey(params);
-  const ref = db.collection(ENV.FIRESTORE_IDEMPOTENCY_COLLECTION).doc(key);
   const createdAtMs = nowMs();
+  if (USE_MEMORY_BACKEND) {
+    const existing = memIdemDocs.get(key);
+    if (!existing) {
+      memIdemDocs.set(key, {
+        key,
+        status: "IN_PROGRESS",
+        summary: null,
+        createdAtMs,
+        updatedAtMs: createdAtMs,
+        expiresAtMs: createdAtMs + ENV.IDEMPOTENCY_TTL_MS,
+        env: params.env,
+        mode: params.mode,
+        symbol: params.symbol,
+        side: params.side,
+        clientOrderId: params.clientOrderId || null,
+        rid: params.rid,
+      });
+      return { key, status: "CLAIMED" };
+    }
+    if (existing.status === "SUCCEEDED") return { key, status: "SUCCEEDED", summary: existing.summary || null };
+    if (existing.status === "IN_PROGRESS") return { key, status: "IN_PROGRESS" };
+    memIdemDocs.set(key, {
+      ...existing,
+      status: "IN_PROGRESS",
+      summary: null,
+      updatedAtMs: createdAtMs,
+      rid: params.rid,
+    });
+    return { key, status: "CLAIMED" };
+  }
+  const ref = db.collection(ENV.FIRESTORE_IDEMPOTENCY_COLLECTION).doc(key);
   let out = { key, status: "IN_PROGRESS" };
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
@@ -373,6 +439,17 @@ async function claimIdempotency(params) {
 
 async function finalizeIdempotency(key, status, summary) {
   if (!key) return;
+  if (USE_MEMORY_BACKEND) {
+    const existing = memIdemDocs.get(key);
+    if (!existing) return;
+    memIdemDocs.set(key, {
+      ...existing,
+      status,
+      summary: summary || null,
+      updatedAtMs: nowMs(),
+    });
+    return;
+  }
   const ref = db.collection(ENV.FIRESTORE_IDEMPOTENCY_COLLECTION).doc(key);
   await ref.set({ status, summary: summary || null, updatedAtMs: nowMs() }, { merge: true });
 }
@@ -1480,17 +1557,32 @@ app.post("/execute", async (req, res) => {
   }
 });
 
-// Cloud Run best-practice: bind 0.0.0.0
-app.listen(ENV.PORT, "0.0.0.0", () => {
-  console.log(`binance-executor listening on :${ENV.PORT}`);
-});
+function startServer(port = ENV.PORT) {
+  return app.listen(port, "0.0.0.0", () => {
+    console.log(`binance-executor listening on :${port}`);
+  });
+}
+
+if ((process.env.EXECUTOR_DISABLE_AUTOSTART || "").toLowerCase() !== "true") {
+  startServer(ENV.PORT);
+}
 
 // Safety logs (Cloud Run)
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
 
-
-
+export const __test = {
+  loadState,
+  saveState,
+  claimIdempotency,
+  finalizeIdempotency,
+  pickBinanceCreds,
+  makeIdempotencyKey,
+  resetMemoryStore: () => {
+    memStateDocs.clear();
+    memIdemDocs.clear();
+  },
+};
 
 
 

@@ -2,14 +2,30 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
+import net from "node:net";
 
-const PORT = 19081;
-const BASE = `http://127.0.0.1:${PORT}`;
 const SECRET = "test-secret";
+let PORT = 0;
+let BASE = "";
 let child;
 
-function startServer() {
+async function getFreePort() {
   return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      server.close(() => resolve(port));
+    });
+    server.on("error", reject);
+  });
+}
+
+function startServer() {
+  return new Promise(async (resolve, reject) => {
+    PORT = await getFreePort();
+    BASE = `http://127.0.0.1:${PORT}`;
+    const logs = [];
     child = spawn("node", ["services/binance-executor/server.js"], {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
@@ -18,12 +34,14 @@ function startServer() {
         EXECUTOR_SECRET: SECRET,
         ALLOW_MAINNET: "false",
         ALLOW_LIVE: "false",
+        EXECUTOR_STATE_BACKEND: "memory",
       },
     });
 
     let ready = false;
     const onData = (buf) => {
       const s = String(buf || "");
+      logs.push(s);
       if (s.includes("binance-executor listening on")) {
         ready = true;
         resolve();
@@ -33,7 +51,7 @@ function startServer() {
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
     child.on("exit", (code) => {
-      if (!ready) reject(new Error(`server exited early: ${code}`));
+      if (!ready) reject(new Error(`server exited early: ${code} logs=${logs.join("|")}`));
     });
   });
 }
