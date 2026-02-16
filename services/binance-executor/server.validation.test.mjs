@@ -147,6 +147,11 @@ test("ALLOW_MAINNET=false + env=mainnet returns 403", async () => {
   assert.equal(res.body.error, "mainnet disabled");
 });
 
+test("pickBinanceCreds hard-fails unknown env", () => {
+  const src = readFileSync("services/binance-executor/server.js", "utf8");
+  assert.match(src, /return \{ error: "invalid env", base: "N\/A", key: "", secret: "" \};/);
+});
+
 test("binance endpoint selection is strict to mode===live", () => {
   const src = readFileSync("services/binance-executor/server.js", "utf8");
   assert.match(src, /const endpoint = mode === "live" \? "\/api\/v3\/order" : "\/api\/v3\/order\/test";/);

@@ -327,11 +327,14 @@ function pickBinanceCreds(env) {
       secret: ENV.BINANCE_TESTNET_API_SECRET,
     };
   }
-  return {
-    base: ENV.BINANCE_MAINNET_BASE,
-    key: ENV.BINANCE_MAINNET_API_KEY,
-    secret: ENV.BINANCE_MAINNET_API_SECRET,
-  };
+  if (env === "mainnet") {
+    return {
+      base: ENV.BINANCE_MAINNET_BASE,
+      key: ENV.BINANCE_MAINNET_API_KEY,
+      secret: ENV.BINANCE_MAINNET_API_SECRET,
+    };
+  }
+  return { error: "invalid env", base: "N/A", key: "", secret: "" };
 }
 
 function signHmac(secret, queryString) {
@@ -347,7 +350,10 @@ async function binancePublicPrice(base, symbol) {
 }
 
 async function binanceOrder({ env, mode, symbol, side, notionalUSDT, quantity, clientOrderId }) {
-  const { base, key, secret } = pickBinanceCreds(env);
+  const { base, key, secret, error } = pickBinanceCreds(env);
+  if (error) {
+    return { ok: false, status: 400, endpoint: "N/A", base, body: { code: -2, msg: error } };
+  }
 
   if (!key || !secret) {
     return { ok: false, status: 401, endpoint: "N/A", base, body: { code: -1, msg: "missing api key/secret" } };
@@ -1398,7 +1404,6 @@ app.listen(ENV.PORT, "0.0.0.0", () => {
 // Safety logs (Cloud Run)
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
-
 
 
 
