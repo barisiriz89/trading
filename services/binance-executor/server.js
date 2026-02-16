@@ -127,6 +127,19 @@ function nowMs() {
 
 function json(res, status, obj) {
   const payload = (obj && typeof obj === "object") ? obj : {};
+  const idem = res?.locals?.idempotency;
+  if (idem && idem.claimed && !idem.finalized) {
+    idem.finalized = true;
+    const summary = {
+      ok: Boolean(payload.ok),
+      reason: payload.reason || payload.error || payload.skipped || null,
+      httpStatus: status,
+    };
+    const state = payload.ok ? "SUCCEEDED" : "FAILED";
+    void finalizeIdempotency(idem.key, state, summary).catch((err) => {
+      console.error("idempotency finalize failed:", err);
+    });
+  }
   const ctx = res?.locals?.executeLogContext;
   if (ctx) {
     const execSide = typeof payload.side === "string" ? String(payload.side).toUpperCase() : (ctx.reqSide || "");
@@ -322,14 +335,46 @@ async function claimIdempotency(params) {
   const key = makeIdempotencyKey(params);
   const ref = db.collection(ENV.FIRESTORE_IDEMPOTENCY_COLLECTION).doc(key);
   const createdAtMs = nowMs();
-  let claimed = false;
+  let out = { key, status: "IN_PROGRESS" };
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
-    if (snap.exists) return;
-    tx.create(ref, { key, createdAtMs, expiresAtMs: createdAtMs + ENV.IDEMPOTENCY_TTL_MS, env: params.env, mode: params.mode, symbol: params.symbol, side: params.side, clientOrderId: params.clientOrderId || null, rid: params.rid });
-    claimed = true;
+    if (!snap.exists) {
+      tx.create(ref, {
+        key,
+        status: "IN_PROGRESS",
+        summary: null,
+        createdAtMs,
+        updatedAtMs: createdAtMs,
+        expiresAtMs: createdAtMs + ENV.IDEMPOTENCY_TTL_MS,
+        env: params.env,
+        mode: params.mode,
+        symbol: params.symbol,
+        side: params.side,
+        clientOrderId: params.clientOrderId || null,
+        rid: params.rid,
+      });
+      out = { key, status: "CLAIMED" };
+      return;
+    }
+    const data = snap.data() || {};
+    if (data.status === "SUCCEEDED") {
+      out = { key, status: "SUCCEEDED", summary: data.summary || null };
+      return;
+    }
+    if (data.status === "IN_PROGRESS") {
+      out = { key, status: "IN_PROGRESS" };
+      return;
+    }
+    tx.update(ref, { status: "IN_PROGRESS", summary: null, updatedAtMs: createdAtMs, rid: params.rid });
+    out = { key, status: "CLAIMED" };
   });
-  return { claimed, key };
+  return out;
+}
+
+async function finalizeIdempotency(key, status, summary) {
+  if (!key) return;
+  const ref = db.collection(ENV.FIRESTORE_IDEMPOTENCY_COLLECTION).doc(key);
+  await ref.set({ status, summary: summary || null, updatedAtMs: nowMs() }, { merge: true });
 }
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Binance helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -648,10 +693,35 @@ app.post("/execute", async (req, res) => {
 
     res.locals.executeLogContext = { rid: requestId, clientOrderId: String(clientOrderId || ''), reqSide: actionSide, strategy: STRATEGY, env, symbol: String(binanceSymbol || ''), mode };
 
-    const idem = await claimIdempotency({ env, mode, symbol: binanceSymbol, side: actionSide, orderType: String(orderType).toUpperCase(), notionalUSDT: Number(notionalUSDT || 0), clientOrderId, ts, rid: requestId });
-    if (!idem.claimed) {
-      return json(res, 200, { ok: true, strategy: STRATEGY, env, mode, symbol: binanceSymbol, side: actionSide, skipped: 'duplicate request', dedupeKey: idem.key, rid: requestId });
+    const idem = await claimIdempotency({
+      env,
+      mode,
+      symbol: binanceSymbol,
+      side: actionSide,
+      orderType: String(orderType).toUpperCase(),
+      notionalUSDT: Number(notionalUSDT || 0),
+      clientOrderId,
+      ts,
+      rid: requestId,
+    });
+    if (idem.status === "IN_PROGRESS") {
+      return json(res, 409, { ok: false, reason: "IN_PROGRESS", dedupeKey: idem.key, rid: requestId });
     }
+    if (idem.status === "SUCCEEDED") {
+      return json(res, 200, {
+        ok: true,
+        strategy: STRATEGY,
+        env,
+        mode,
+        symbol: binanceSymbol,
+        side: actionSide,
+        skipped: "duplicate request",
+        dedupeKey: idem.key,
+        cached: idem.summary || null,
+        rid: requestId,
+      });
+    }
+    res.locals.idempotency = { key: idem.key, claimed: true, finalized: false };
 
     const t = nowMs();
     const state = await loadState(env, binanceSymbol);
@@ -1418,7 +1488,6 @@ app.listen(ENV.PORT, "0.0.0.0", () => {
 // Safety logs (Cloud Run)
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
-
 
 
 
