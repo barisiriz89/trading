@@ -36,6 +36,14 @@ Project: `project-fffcccdf-8872-401a-870`
    - duplicate response includes `skipped:"duplicate request"`.
    - `STATE_WRITE_SKIPPED` appears for non-duplicate `mode=test` path.
 
+## Firestore TTL Verification Checklist
+- TTL field: `expiresAtMs` in collection `executor_idempotency` (or value of `FIRESTORE_IDEMPOTENCY_COLLECTION`).
+- Where to verify: Google Cloud Console -> Firestore -> Databases -> TTL policies.
+- Good state:
+  - policy exists for the idempotency collection group,
+  - field is exactly `expiresAtMs`,
+  - policy status is `Active/Enabled` (not `Creating` or `Disabled`).
+
 ## Commands
 ```bash
 gcloud run services logs read binance-executor --project project-fffcccdf-8872-401a-870 --region europe-west1 --limit 120
