@@ -171,8 +171,10 @@ function isAllowedSymbol(sym) {
 }
 
 function assertEnvMode(env, mode) {
-  if (env === "mainnet" && !ENV.ALLOW_MAINNET) return "mainnet disabled";
-  if (mode === "live" && !ENV.ALLOW_LIVE) return "live disabled";
+  if (!["mainnet", "testnet"].includes(env)) return { status: 400, error: "invalid env" };
+  if (!["test", "live"].includes(mode)) return { status: 400, error: "invalid mode" };
+  if (env === "mainnet" && !ENV.ALLOW_MAINNET) return { status: 403, error: "mainnet disabled" };
+  if (mode === "live" && !ENV.ALLOW_LIVE) return { status: 403, error: "live disabled" };
   return null;
 }
 
@@ -284,6 +286,16 @@ async function loadState(env, symbol) {
   return migrateOldState(snap.data());
 }
 
+async function saveState(env, symbol, state) {
+  const ref = db.collection(ENV.FIRESTORE_COLLECTION).doc(docIdFor(env, symbol));
+  await ref.set({
+    ...state,
+    env,
+    symbol,
+    updatedAtMs: nowMs(),
+  });
+}
+
 
 
 function makeIdempotencyKey({ env, mode, symbol, side, orderType, notionalUSDT, clientOrderId, ts }) {
@@ -358,7 +370,7 @@ async function binanceOrder({ env, mode, symbol, side, notionalUSDT, quantity, c
 
   const queryString = params.toString();
   const signature = signHmac(secret, queryString);
-  const endpoint = mode === "test" ? "/api/v3/order/test" : "/api/v3/order";
+  const endpoint = mode === "live" ? "/api/v3/order" : "/api/v3/order/test";
   const url = `${base}${endpoint}?${queryString}&signature=${signature}`;
 
   const r = await fetchWithTimeout(url, {
@@ -565,8 +577,8 @@ app.post("/execute", async (req, res) => {
     if (!isAuthed(req)) return json(res, 401, { ok: false, error: "unauthorized", rid: requestId });
 
     const {
-      env = "mainnet",
-      mode = "test",
+      env: rawEnv = "mainnet",
+      mode: rawMode = "test",
       binanceSymbol,
       side,
       orderType = "MARKET",
@@ -577,6 +589,8 @@ app.post("/execute", async (req, res) => {
     } = req.body || {};
 
     const STRATEGY = normalizeStrategy(strategy);
+    const env = String(rawEnv || "").toLowerCase();
+    const mode = String(rawMode || "").toLowerCase();
 
     // lightweight structured log (secret masked)
     console.log(
@@ -600,13 +614,16 @@ app.post("/execute", async (req, res) => {
     }
 
     const modeErr = assertEnvMode(env, mode);
-    if (modeErr) return json(res, 400, { ok: false, error: modeErr, rid: requestId });
+    if (modeErr) return json(res, modeErr.status, { ok: false, error: modeErr.error, rid: requestId });
 
     if (String(orderType).toUpperCase() !== "MARKET") {
       return json(res, 400, { ok: false, error: "only MARKET supported", rid: requestId });
     }
 
     const actionSide = String(side || "").toUpperCase();
+    if (!["BUY", "SELL", "TICK"].includes(actionSide)) {
+      return json(res, 400, { ok: false, error: "invalid side", rid: requestId });
+    }
     
 
     res.locals.executeLogContext = { rid: requestId, clientOrderId: String(clientOrderId || ''), reqSide: actionSide, strategy: STRATEGY, env, symbol: String(binanceSymbol || ''), mode };
@@ -949,6 +966,7 @@ app.post("/execute", async (req, res) => {
     if (actionSide === "BUY") {
       // Cooldown ONLY for BUY
       if (state.lastActionMs && t - state.lastActionMs < ENV.COOLDOWN_MS) {
+        await persistState();
         return json(res, 200, {
           ok: true,
           strategy: STRATEGY,
@@ -1380,7 +1398,6 @@ app.listen(ENV.PORT, "0.0.0.0", () => {
 // Safety logs (Cloud Run)
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
-
 
 
 
