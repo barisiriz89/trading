@@ -616,6 +616,9 @@ app.post("/execute", async (req, res) => {
       return json(res, 200, { ok: true, strategy: STRATEGY, env, mode, symbol: binanceSymbol, side: actionSide, skipped: 'duplicate request', dedupeKey: idem.key, rid: requestId });
     }
 
+    const t = nowMs();
+    const state = await loadState(env, binanceSymbol);
+
     
     const persistState = async () => {
       if (mode === 'test') {
@@ -1377,6 +1380,9 @@ app.listen(ENV.PORT, "0.0.0.0", () => {
 // Safety logs (Cloud Run)
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+
+
+
 
 
 
