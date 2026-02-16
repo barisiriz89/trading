@@ -622,7 +622,7 @@ app.post("/execute", async (req, res) => {
         console.log('STATE_WRITE_SKIPPED:', JSON.stringify({ rid: requestId, env, mode, symbol: binanceSymbol, strategy: STRATEGY, reason: 'mode=test' }));
         return;
       }
-      await persistState();
+      await saveState(env, binanceSymbol, state);
     };
 
     // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Price snapshot (with cache) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1377,6 +1377,7 @@ app.listen(ENV.PORT, "0.0.0.0", () => {
 // Safety logs (Cloud Run)
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+
 
 
 
