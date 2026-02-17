@@ -8,6 +8,8 @@
   "scripts": {
     "install:all": "npm install",
     "test": "npm --workspaces --if-present run test",
-    "lint": "npm --workspaces --if-present run lint"
+    "lint": "npm --workspaces --if-present run lint",
+    "poly:dev": "npm --workspace services/polymarket-bot run dev",
+    "poly:tick": "npm --workspace services/polymarket-bot run tick"
   }
 }
