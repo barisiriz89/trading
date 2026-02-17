@@ -10,6 +10,8 @@
     "test": "npm --workspaces --if-present run test",
     "lint": "npm --workspaces --if-present run lint",
     "poly:dev": "npm --workspace services/polymarket-bot run dev",
-    "poly:tick": "npm --workspace services/polymarket-bot run tick"
+    "poly:tick": "npm --workspace services/polymarket-bot run tick",
+    "poly:test": "npm --workspace services/polymarket-bot run poly:test",
+    "poly:smoke": "./scripts/poly_smoke.sh"
   }
 }

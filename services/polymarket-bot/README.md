@@ -1,63 +1,86 @@
-# Polymarket Bot (5m Canary v1)
+# Polymarket Bot (5m Canary)
 
-Express service for canary live trading with 3 indicators and 2-of-3 confirmation.
+Service: `services/polymarket-bot`
 
 ## Endpoints
-- `GET /healthz` -> `{ ok: true, ts }`
-- `GET /status` -> in-memory state + last run summary
-- `POST /tick` -> runs one strategy evaluation + optional trade
+- `GET /healthz`
+- `GET /status`
+- `POST /tick` (internal indicator pipeline)
+- `POST /execute` (TradingView quorum execution, alias of tick decision handler)
 
-## Strategy
-Runs on last fully closed 5m candle (built from 1m price history of YES token).
+## TradingView `/execute` payload
+```json
+{
+  "secret": "tv_...",
+  "env": "mainnet",
+  "mode": "test",
+  "marketSlug": "btc-updown-5m-1771368900",
+  "votes": [
+    {"name":"ema","side":"UP"},
+    {"name":"rsi","side":"UP"},
+    {"name":"donchian","side":"DOWN"}
+  ],
+  "minAgree": 2,
+  "notionalUSD": 5,
+  "clientOrderId": "tv-btc-5m-123",
+  "ts": 1771368900000
+}
+```
 
-Indicators:
-- Trend: `EMA20 vs EMA50` and `close vs EMA20`
-- Momentum: `RSI14`
-- Breakout: `Donchian20`
+Validation order:
+1. secret auth (`POLY_TV_SECRET`)
+2. env/mode/votes/notional/clientOrderId/ts
+3. idempotency key creation
 
-Decision:
-- `LONG` (buy YES) when long votes >= 2
-- `SHORT` (buy NO) when short votes >= 2
-- otherwise `FLAT`
+Invalid payloads never consume idempotency slot.
 
-## Required Env
-- `POLY_MARKET_SLUG` (unless overriding token ids)
-- `POLY_YES_TOKEN_ID` + `POLY_NO_TOKEN_ID` (optional direct override)
+## Discovery
+If `marketSlug` is not provided, bot auto-selects tradable market from:
+- `GET https://gamma-api.polymarket.com/events?order=id&ascending=false&closed=false&limit=400`
+- filters slug prefix `btc-updown-5m-`
+- requires tradable flags (`acceptingOrders`, `active`, not `closed`, `approved`)
+- picks nearest upcoming start/end time
+- caches selected market for 20 seconds
 
-## Risk Guardrails
-- `POLY_KILL_SWITCH=true` blocks trading
-- `POLY_DRY_RUN=true` default; compute only, no orders
-- `POLY_COOLDOWN_BARS=2` default
-- `POLY_MAX_TRADES_PER_HOUR=3` default
-- `POLY_MAX_POSITION_USD=50` default
-- `POLY_ORDER_USD=5` default
-- `POLY_STRATEGY_VERSION=v1.0.0` default
-
-## Order Execution Env
-- `POLY_PRIVATE_KEY` (required when `POLY_DRY_RUN=false`)
+## Env Vars
+- `PORT` default `19082`
+- `POLY_TV_SECRET` required for `/execute`
+- `POLY_YES_TOKEN_ID` + `POLY_NO_TOKEN_ID` override all token discovery
+- `POLY_CLOB_TOKEN_IDS` optional JSON array override fallback, format: `["yesTokenId","noTokenId"]`
+- `POLY_DRY_RUN` default `true`
+- `POLY_KILL_SWITCH` default `false`
+- `POLY_COOLDOWN_BARS` default `2`
+- `POLY_MAX_TRADES_PER_HOUR` default `3`
+- `POLY_MAX_POSITION_USD` default `50`
+- `POLY_ORDER_USD` default `5` (used by `/tick`)
+- `POLY_STRATEGY_VERSION` default `v1.0.0`
+- `POLY_PRIVATE_KEY` required only for live order placement
 - `POLY_FUNDER_ADDRESS` optional
-- `POLY_CLOB_HOST=https://clob.polymarket.com`
+- `POLY_CLOB_HOST` default `https://clob.polymarket.com`
+- `POLY_GAMMA_HOST` default `https://gamma-api.polymarket.com`
 
-## Other Env
-- `PORT=19082`
-- `POLY_LOOKBACK_SEC=21600` (6h)
-- `POLY_GAMMA_HOST=https://gamma-api.polymarket.com`
-
-## State
-- In-memory state for cooldown/trade limits
-- Optional local persistence: `services/polymarket-bot/.state.json`
-
-## Local Run
+## Run
 ```bash
-PORT=19082 POLY_MARKET_SLUG='your-market-slug' POLY_DRY_RUN=true npm run poly:dev
+PORT=19082 POLY_DRY_RUN=true POLY_TV_SECRET='tv_xxx' npm run poly:dev
 ```
 
-## Trigger One Tick
+## Find Active BTC Up/Down 5m Market
 ```bash
-curl -sS -X POST http://localhost:19082/tick
+python3 scripts/find_active_btc_updown_5m.py
 ```
 
-## Status
+## Execute Example (DRY_RUN)
 ```bash
-curl -sS http://localhost:19082/status
+curl -sS -X POST http://localhost:19082/execute -H 'content-type: application/json' -d '{"secret":"tv_xxx","env":"mainnet","mode":"test","votes":[{"name":"ema","side":"UP"},{"name":"rsi","side":"UP"},{"name":"donch","side":"DOWN"}],"minAgree":2,"notionalUSD":5,"clientOrderId":"tv-btc-5m-1","ts":1771368900000}'
+```
+
+## Test
+```bash
+npm run poly:test
+```
+
+## Local Smoke
+Service acikken (`PORT=19082`):
+```bash
+POLY_TV_SECRET='tv_xxx' npm run poly:smoke
 ```
