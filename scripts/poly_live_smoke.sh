@@ -36,14 +36,15 @@ print(int(time.time()*1000) + (random.randint(1,999) * 300000))
 PY
 )"
 
-off_payload="$tmp_dir/live_off.json"
-off_resp="$tmp_dir/live_off_resp.json"
-cat > "$off_payload" <<JSON
+if [ "$EXPECT_LIVE_ON" != "true" ]; then
+  off_payload="$tmp_dir/live_off.json"
+  off_resp="$tmp_dir/live_off_resp.json"
+  cat > "$off_payload" <<JSON
 {"secret":"$SECRET","env":"mainnet","mode":"live","votes":[{"name":"ema","side":"UP"},{"name":"rsi","side":"UP"},{"name":"donch","side":"DOWN"}],"minAgree":2,"notionalUSD":5,"clientOrderId":"live-off-$(date +%s)","ts":$ts1}
 JSON
 
-post_execute "$off_payload" "$off_resp"
-python3 - "$off_resp" <<'PY'
+  post_execute "$off_payload" "$off_resp"
+  python3 - "$off_resp" <<'PY'
 import json,sys
 with open(sys.argv[1],"r",encoding="utf-8") as f:
     j=json.load(f)
@@ -54,7 +55,6 @@ if order.get("reason") != "live_not_enabled":
     raise SystemExit("FAIL: live gate off testinde reason live_not_enabled olmali")
 PY
 
-if [ "$EXPECT_LIVE_ON" != "true" ]; then
   echo "PASS: poly_live_smoke (live gate-off: live_not_enabled)"
   exit 0
 fi
