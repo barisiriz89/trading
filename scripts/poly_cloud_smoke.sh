@@ -22,8 +22,7 @@ check_get_json() {
   local code
   code="$(curl -sS -o "$tmp_dir/body.json" -w "%{http_code}" "$BASE_URL$path")"
   if [ "$code" != "200" ]; then
-    echo "FAIL: GET $path status=$code" >&2
-    exit 22
+    return 1
   fi
   python3 - "$tmp_dir/body.json" <<'PY'
 import json,sys
@@ -46,8 +45,11 @@ post_execute() {
   fi
 }
 
-check_get_json "/healthz/"
-check_get_json "/status"
+if ! check_get_json "/healthz/" >/dev/null 2>&1 && ! check_get_json "/healthz" >/dev/null 2>&1; then
+  echo "FAIL: GET /healthz and /healthz/ status!=200" >&2
+  exit 22
+fi
+check_get_json "/status" || { echo "FAIL: GET /status status!=200" >&2; exit 22; }
 
 CID="cloud-smoke-$(date +%s)"
 TS="$(python3 - <<'PY'

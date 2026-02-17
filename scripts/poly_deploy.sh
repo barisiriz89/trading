@@ -8,6 +8,15 @@ SECRET="${POLY_TV_SECRET:-}"
 MARKET_SLUG="${POLY_MARKET_SLUG:-}"
 YES_TOKEN_ID="${POLY_YES_TOKEN_ID:-}"
 NO_TOKEN_ID="${POLY_NO_TOKEN_ID:-}"
+DRY_RUN="${POLY_DRY_RUN:-true}"
+LIVE_ENABLED="${POLY_LIVE_ENABLED:-}"
+LIVE_CONFIRM="${POLY_LIVE_CONFIRM:-}"
+AUTO_SIZE="${POLY_AUTO_SIZE:-}"
+START_NOTIONAL="${POLY_START_NOTIONAL_USD:-}"
+SIZE_MULT="${POLY_SIZE_MULT:-}"
+MAX_NOTIONAL="${POLY_MAX_NOTIONAL_USD:-}"
+FUNDER_ADDRESS="${POLY_FUNDER_ADDRESS:-}"
+SIGNATURE_TYPE="${POLY_SIGNATURE_TYPE:-}"
 
 if [ -z "$PROJECT_ID" ]; then
   PROJECT_ID="$(gcloud config get-value project 2>/dev/null || true)"
@@ -26,7 +35,7 @@ cleanup() { rm -f "$env_file"; }
 trap cleanup EXIT
 
 cat > "$env_file" <<ENVVARS
-POLY_DRY_RUN: "true"
+POLY_DRY_RUN: "$DRY_RUN"
 POLY_TV_SECRET: "$SECRET"
 ENVVARS
 
@@ -48,7 +57,55 @@ POLY_NO_TOKEN_ID: "$NO_TOKEN_ID"
 ENVVARS
 fi
 
-echo "Deploying $SERVICE to Cloud Run ($PROJECT_ID/$REGION) with POLY_DRY_RUN=true"
+if [ -n "$LIVE_ENABLED" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_LIVE_ENABLED: "$LIVE_ENABLED"
+ENVVARS
+fi
+
+if [ -n "$LIVE_CONFIRM" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_LIVE_CONFIRM: "$LIVE_CONFIRM"
+ENVVARS
+fi
+
+if [ -n "$AUTO_SIZE" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_AUTO_SIZE: "$AUTO_SIZE"
+ENVVARS
+fi
+
+if [ -n "$START_NOTIONAL" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_START_NOTIONAL_USD: "$START_NOTIONAL"
+ENVVARS
+fi
+
+if [ -n "$SIZE_MULT" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_SIZE_MULT: "$SIZE_MULT"
+ENVVARS
+fi
+
+if [ -n "$MAX_NOTIONAL" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_MAX_NOTIONAL_USD: "$MAX_NOTIONAL"
+ENVVARS
+fi
+
+if [ -n "$FUNDER_ADDRESS" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_FUNDER_ADDRESS: "$FUNDER_ADDRESS"
+ENVVARS
+fi
+
+if [ -n "$SIGNATURE_TYPE" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_SIGNATURE_TYPE: "$SIGNATURE_TYPE"
+ENVVARS
+fi
+
+echo "Deploying $SERVICE to Cloud Run ($PROJECT_ID/$REGION) with POLY_DRY_RUN=$DRY_RUN"
 gcloud run deploy "$SERVICE" \
   --project "$PROJECT_ID" \
   --region "$REGION" \

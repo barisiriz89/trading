@@ -37,7 +37,9 @@ const ENV = {
   POLY_STRATEGY_VERSION: String(process.env.POLY_STRATEGY_VERSION || 'v1.0.0').trim(),
   POLY_PRIVATE_KEY: String(process.env.POLY_PRIVATE_KEY || '').trim(),
   POLY_FUNDER_ADDRESS: String(process.env.POLY_FUNDER_ADDRESS || '').trim(),
+  POLY_SIGNATURE_TYPE: Number(process.env.POLY_SIGNATURE_TYPE || NaN),
   POLY_TV_SECRET: String(process.env.POLY_TV_SECRET || '').trim(),
+  POLY_GEOBLOCK_URL: String(process.env.POLY_GEOBLOCK_URL || 'https://polymarket.com/api/geoblock').trim(),
   POLY_LIVE_ENABLED: String(process.env.POLY_LIVE_ENABLED || 'false').toLowerCase() === 'true',
   POLY_LIVE_CONFIRM: String(process.env.POLY_LIVE_CONFIRM || '').trim(),
   POLY_AUTO_SIZE: String(process.env.POLY_AUTO_SIZE || 'false').toLowerCase() === 'true',
@@ -131,6 +133,22 @@ async function fetchJson(url) {
     throw new Error(`HTTP ${resp.status} from ${url}: ${body.slice(0, 250)}`);
   }
   return resp.json();
+}
+
+async function fetchGeoblockStatus() {
+  if (!ENV.POLY_GEOBLOCK_URL) return null;
+  try {
+    const payload = await fetchJson(ENV.POLY_GEOBLOCK_URL);
+    if (!payload || typeof payload !== 'object') return null;
+    return {
+      blocked: Boolean(payload.blocked),
+      country: String(payload.country || ''),
+      region: String(payload.region || ''),
+      ip: String(payload.ip || ''),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function resolveEnvTokenOverrides() {
@@ -486,12 +504,46 @@ function buildOrderIntent(direction, yesTokenId, noTokenId) {
 }
 
 function normalizeClobErrorReason(err) {
-  const raw = err instanceof Error ? err.message : String(err || '');
-  const msg = raw.toLowerCase();
-  if (msg.includes('trading restricted in your region') || msg.includes('geoblock')) return 'geoblocked_region';
-  if (msg.includes('could not create api key') || msg.includes('api credentials are needed')) return 'clob_auth_failed';
-  if (msg.includes('forbidden')) return 'clob_forbidden';
-  return `clob_error:${raw.slice(0, 120)}`;
+  const status = Number(
+    err?.status
+    ?? err?.response?.status
+    ?? err?.data?.status
+    ?? err?.result?.status
+    ?? NaN,
+  );
+  const statusCode = Number.isFinite(status) ? Number(status) : null;
+
+  let safeMsg = '';
+  if (typeof err?.data?.error === 'string' && err.data.error.trim()) safeMsg = err.data.error.trim();
+  else if (typeof err?.error === 'string' && err.error.trim()) safeMsg = err.error.trim();
+  else safeMsg = (err instanceof Error ? err.message : String(err || '')).trim();
+  if (safeMsg.length > 160) safeMsg = safeMsg.slice(0, 160);
+
+  const msg = safeMsg.toLowerCase();
+  if (msg.includes('trading restricted in your region') || msg.includes('geoblock')) {
+    return { reason: 'geoblock', upstreamStatus: statusCode ?? 403, upstreamMessage: 'trading restricted in your region' };
+  }
+  if (msg.includes('could not create api key')) {
+    return { reason: 'api_key_create_failed', upstreamStatus: statusCode ?? 400, upstreamMessage: 'could not create api key' };
+  }
+  if (msg.includes('api credentials are needed')) {
+    return { reason: 'api_key_create_failed', upstreamStatus: statusCode ?? 400, upstreamMessage: 'api credentials are needed' };
+  }
+  return { reason: 'clob_error', upstreamStatus: statusCode, upstreamMessage: safeMsg || 'unknown clob error' };
+}
+
+function computeRequestDryRun(mode) {
+  return mode === 'test'
+    || ENV.POLY_DRY_RUN
+    || !ENV.POLY_LIVE_ENABLED
+    || ENV.POLY_LIVE_CONFIRM !== 'I_UNDERSTAND';
+}
+
+function resolveSignatureType() {
+  if (Number.isInteger(ENV.POLY_SIGNATURE_TYPE) && ENV.POLY_SIGNATURE_TYPE >= 0 && ENV.POLY_SIGNATURE_TYPE <= 2) {
+    return ENV.POLY_SIGNATURE_TYPE;
+  }
+  return ENV.POLY_FUNDER_ADDRESS ? 1 : 0;
 }
 
 async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrderId, midPrice }) {
@@ -517,7 +569,14 @@ async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrder
   }
 
   const signer = new Wallet(ENV.POLY_PRIVATE_KEY);
-  const client = new ClobClient(ENV.POLY_CLOB_HOST, 137, signer, undefined, undefined, ENV.POLY_FUNDER_ADDRESS || undefined);
+  const client = new ClobClient(
+    ENV.POLY_CLOB_HOST,
+    137,
+    signer,
+    undefined,
+    resolveSignatureType(),
+    ENV.POLY_FUNDER_ADDRESS || undefined,
+  );
   const maybeCreate = client.createOrDeriveApiKey || client.createApiKey || client.deriveApiKey;
   if (typeof maybeCreate === 'function') {
     const credsRaw = await maybeCreate.call(client);
@@ -552,7 +611,7 @@ async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrder
   };
 }
 
-async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId, mode, midPrice }) {
+async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId, mode, dryRun, midPrice }) {
   if (mode === 'test') {
     return {
       skipped: true,
@@ -569,7 +628,7 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
     };
   }
 
-  if (ENV.POLY_DRY_RUN || ENV.POLY_KILL_SWITCH) {
+  if (dryRun || ENV.POLY_KILL_SWITCH) {
     return {
       skipped: true,
       reason: ENV.POLY_KILL_SWITCH ? 'kill_switch' : 'dry_run',
@@ -585,6 +644,18 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
     };
   }
 
+  const geo = await fetchGeoblockStatus();
+  if (geo?.blocked) {
+    const detail = [geo.country, geo.region].filter(Boolean).join('/');
+    return {
+      skipped: true,
+      reason: 'geoblock',
+      upstreamStatus: 403,
+      upstreamMessage: detail ? `trading restricted in your region (${detail})` : 'trading restricted in your region',
+      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+    };
+  }
+
   try {
     const mod = await import('@polymarket/clob-client');
     const walletMod = await import('@ethersproject/wallet');
@@ -594,7 +665,14 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
     if (!Wallet) throw new Error('ethers_wallet_constructor_not_found');
 
     const signer = new Wallet(ENV.POLY_PRIVATE_KEY);
-    const client = new ClobClient(ENV.POLY_CLOB_HOST, 137, signer, undefined, undefined, ENV.POLY_FUNDER_ADDRESS || undefined);
+    const client = new ClobClient(
+      ENV.POLY_CLOB_HOST,
+      137,
+      signer,
+      undefined,
+      resolveSignatureType(),
+      ENV.POLY_FUNDER_ADDRESS || undefined,
+    );
     const maybeCreate = client.createOrDeriveApiKey || client.createApiKey || client.deriveApiKey;
     if (typeof maybeCreate === 'function') {
       const credsRaw = await maybeCreate.call(client);
@@ -620,9 +698,12 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
 
     const result = await postOrder.call(client, orderPayload);
     if (result?.error) {
+      const mapped = normalizeClobErrorReason(result.error);
       return {
         skipped: true,
-        reason: normalizeClobErrorReason(result.error),
+        reason: mapped.reason,
+        upstreamStatus: mapped.upstreamStatus,
+        upstreamMessage: mapped.upstreamMessage,
         intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
         result,
       };
@@ -633,9 +714,12 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
       intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   } catch (err) {
+    const mapped = normalizeClobErrorReason(err);
     return {
       skipped: true,
-      reason: normalizeClobErrorReason(err),
+      reason: mapped.reason,
+      upstreamStatus: mapped.upstreamStatus,
+      upstreamMessage: mapped.upstreamMessage,
       intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
@@ -815,6 +899,7 @@ async function runExecute(body, requestRid) {
   }
 
   const req = parsed.value;
+  const requestDryRun = computeRequestDryRun(req.mode);
   const quorum = computeQuorumDecision(req.votes, req.minAgree);
   const decision = quorum.decision;
   const outcome = decision === 'UP' ? 'Up' : decision === 'DOWN' ? 'Down' : null;
@@ -835,7 +920,8 @@ async function runExecute(body, requestRid) {
     voteCounts: quorum.counts,
     voteSummary: quorum.voteSummary,
     intervalKey,
-    dryRun: ENV.POLY_DRY_RUN,
+    mode: req.mode,
+    dryRun: requestDryRun,
     killSwitch: ENV.POLY_KILL_SWITCH,
     sizing: {
       auto: sizing.auto,
@@ -856,6 +942,8 @@ async function runExecute(body, requestRid) {
       dryRun: resp?.dryRun,
       tradeExecuted: Boolean(resp?.tradeExecuted),
       deduped: Boolean(resp?.deduped),
+      reason: resp?.reason,
+      upstreamStatus: resp?.upstreamStatus ?? null,
       computedNotionalUSD: sizing.computedNotionalUSD,
     });
   };
@@ -909,11 +997,6 @@ async function runExecute(body, requestRid) {
       deduped: false,
       dedupKey,
       reason: guardrail,
-      order: {
-        skipped: true,
-        reason: guardrail,
-        intent: { side: 'BUY', tokenId, outcome, amountUsd: sizing.computedNotionalUSD, clientOrderId: req.clientOrderId, midPrice: null },
-      },
       tradeExecuted: false,
       state: {
         lastTradeBarClose: state.lastTradeBarClose,
@@ -935,6 +1018,7 @@ async function runExecute(body, requestRid) {
     notionalUSD: sizing.computedNotionalUSD,
     clientOrderId: req.clientOrderId,
     mode: req.mode,
+    dryRun: requestDryRun,
     midPrice,
   });
 
@@ -950,13 +1034,17 @@ async function runExecute(body, requestRid) {
   }
 
   const reason = order.skipped ? order.reason : 'trade_executed';
+  const upstreamStatus = order.skipped ? (order.upstreamStatus ?? null) : null;
+  const upstreamMessage = order.skipped ? (order.upstreamMessage ?? null) : null;
   const resp = {
     ...base,
     deduped: false,
     dedupKey,
     reason,
     voteSummary: quorum.voteSummary,
-    order,
+    ...(upstreamStatus ? { upstreamStatus } : {}),
+    ...(upstreamMessage ? { upstreamMessage } : {}),
+    ...(!order.skipped ? { order } : {}),
     tradeExecuted,
     state: {
       lastTradeBarClose: state.lastTradeBarClose,
@@ -975,6 +1063,9 @@ const app = express();
 app.use(express.json({ limit: '128kb' }));
 
 app.get('/healthz', (_req, res) => {
+  res.status(200).json({ ok: true, ts: new Date().toISOString() });
+});
+app.get('/healthz/', (_req, res) => {
   res.status(200).json({ ok: true, ts: new Date().toISOString() });
 });
 

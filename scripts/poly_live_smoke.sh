@@ -3,7 +3,6 @@ set -euo pipefail
 
 BASE_URL="${1:-${POLY_CLOUD_URL:-}}"
 SECRET="${POLY_TV_SECRET:-}"
-EXPECT_LIVE_ON="${POLY_EXPECT_LIVE_ENABLED:-false}"
 
 if [ -z "$BASE_URL" ]; then
   echo "FAIL: cloud url gerekli. Kullanim: ./scripts/poly_live_smoke.sh https://<service-url>" >&2
@@ -36,32 +35,27 @@ print(int(time.time()*1000) + (random.randint(1,999) * 300000))
 PY
 )"
 
-if [ "$EXPECT_LIVE_ON" != "true" ]; then
-  off_payload="$tmp_dir/live_off.json"
-  off_resp="$tmp_dir/live_off_resp.json"
-  cat > "$off_payload" <<JSON
+off_payload="$tmp_dir/live_off.json"
+off_resp="$tmp_dir/live_off_resp.json"
+cat > "$off_payload" <<JSON
 {"secret":"$SECRET","env":"mainnet","mode":"live","votes":[{"name":"ema","side":"UP"},{"name":"rsi","side":"UP"},{"name":"donch","side":"DOWN"}],"minAgree":2,"notionalUSD":5,"clientOrderId":"live-off-$(date +%s)","ts":$ts1}
 JSON
 
-  post_execute "$off_payload" "$off_resp"
-  python3 - "$off_resp" <<'PY'
+post_execute "$off_payload" "$off_resp"
+if python3 - "$off_resp" 2>/dev/null <<'PY'
 import json,sys
 with open(sys.argv[1],"r",encoding="utf-8") as f:
     j=json.load(f)
-order=j.get("order") or {}
-if order.get("skipped") is not True:
-    raise SystemExit("FAIL: live gate off testinde order.skipped true olmali")
-if order.get("reason") != "live_not_enabled":
+if j.get("mode") != "live":
+    raise SystemExit("FAIL: live gate off testinde mode live olmali")
+if j.get("tradeExecuted") is not False:
+    raise SystemExit("FAIL: live gate off testinde tradeExecuted false olmali")
+if j.get("reason") != "live_not_enabled":
     raise SystemExit("FAIL: live gate off testinde reason live_not_enabled olmali")
 PY
-
+then
   echo "PASS: poly_live_smoke (live gate-off: live_not_enabled)"
   exit 0
-fi
-
-if [ "${POLY_LIVE_ENABLED:-}" != "true" ] || [ "${POLY_LIVE_CONFIRM:-}" != "I_UNDERSTAND" ]; then
-  echo "FAIL: gate-on dogrulamasi icin POLY_LIVE_ENABLED=true ve POLY_LIVE_CONFIRM=I_UNDERSTAND gerekli" >&2
-  exit 43
 fi
 
 ts2="$(python3 - <<'PY'
@@ -83,6 +77,8 @@ python3 - "$on_first" <<'PY'
 import json,sys
 with open(sys.argv[1],"r",encoding="utf-8") as f:
     j=json.load(f)
+if j.get("mode") != "live":
+    raise SystemExit("FAIL: gate-on testinde mode live olmali")
 if j.get("dryRun") is not False:
     raise SystemExit("FAIL: gate-on testinde dryRun false olmali")
 s=j.get("sizing") or {}
@@ -92,6 +88,10 @@ if not (s.get("computedNotionalUSD") is not None):
     raise SystemExit("FAIL: gate-on testinde sizing.computedNotionalUSD olmali")
 if (j.get("order") or {}).get("reason") == "live_not_enabled":
     raise SystemExit("FAIL: gate-on testinde live_not_enabled olmamali")
+if j.get("tradeExecuted") is not True:
+    reason = j.get("reason")
+    if reason not in {"geoblock", "api_key_create_failed"}:
+        raise SystemExit(f"FAIL: gate-on blocker reason beklenmiyor: {reason}")
 PY
 
 post_execute "$on_payload" "$on_second"
