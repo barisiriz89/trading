@@ -5,6 +5,9 @@ PROJECT_ID="${POLY_GCP_PROJECT:-}"
 REGION="${POLY_GCP_REGION:-europe-west1}"
 SERVICE="${POLY_SERVICE:-polymarket-bot}"
 SECRET="${POLY_TV_SECRET:-}"
+MARKET_SLUG="${POLY_MARKET_SLUG:-}"
+YES_TOKEN_ID="${POLY_YES_TOKEN_ID:-}"
+NO_TOKEN_ID="${POLY_NO_TOKEN_ID:-}"
 
 if [ -z "$PROJECT_ID" ]; then
   PROJECT_ID="$(gcloud config get-value project 2>/dev/null || true)"
@@ -26,6 +29,24 @@ cat > "$env_file" <<ENVVARS
 POLY_DRY_RUN: "true"
 POLY_TV_SECRET: "$SECRET"
 ENVVARS
+
+if [ -n "$MARKET_SLUG" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_MARKET_SLUG: "$MARKET_SLUG"
+ENVVARS
+fi
+
+if [ -n "$YES_TOKEN_ID" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_YES_TOKEN_ID: "$YES_TOKEN_ID"
+ENVVARS
+fi
+
+if [ -n "$NO_TOKEN_ID" ]; then
+  cat >> "$env_file" <<ENVVARS
+POLY_NO_TOKEN_ID: "$NO_TOKEN_ID"
+ENVVARS
+fi
 
 echo "Deploying $SERVICE to Cloud Run ($PROJECT_ID/$REGION) with POLY_DRY_RUN=true"
 gcloud run deploy "$SERVICE" \
