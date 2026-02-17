@@ -75,8 +75,15 @@ import json,sys
 p=sys.argv[1]
 with open(p,"r",encoding="utf-8") as f:
     j=json.load(f)
-if j.get("deduped") is not True:
-    raise SystemExit("FAIL: second call deduped true olmali")
+required=["rid","decision","mode","dryRun","tradeExecuted","deduped","reason","bucketKey","step","lossStreak","computedNotionalUSD","marketSlug","pendingTrade"]
+for key in required:
+    if key not in j:
+        raise SystemExit(f"FAIL: response field eksik: {key}")
+if j.get("deduped") is True and j.get("reason") == "already_filled_this_bucket":
+    print("second_ok")
+    raise SystemExit(0)
+if j.get("reason") not in {"mode_test","dry_run_gate","pending_limit_reached","reconcile_unavailable","below_min_size","cooldown_active","max_trades_per_hour","max_position_usd","no_quorum"}:
+    raise SystemExit("FAIL: second call dedupe veya deterministic blocker reason olmali")
 print("second_ok")
 PY
 

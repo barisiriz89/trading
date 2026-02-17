@@ -14,6 +14,7 @@ import {
   parseJsonArrayLike,
   validateExecutePayload,
 } from './lib/execute-core.js';
+import { applySettlementOutcome } from './lib/reconcile-state.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -46,10 +47,24 @@ const ENV = {
   POLY_START_NOTIONAL_USD: Number(process.env.POLY_START_NOTIONAL_USD || 1),
   POLY_SIZE_MULT: Number(process.env.POLY_SIZE_MULT || 2),
   POLY_MAX_NOTIONAL_USD: Number(process.env.POLY_MAX_NOTIONAL_USD || 16),
+  POLY_FEE_RATE_BPS_RAW: String(process.env.POLY_FEE_RATE_BPS || '').trim(),
+  POLY_ORDER_TYPE: String(process.env.POLY_ORDER_TYPE || 'FOK').trim().toUpperCase(),
+  POLY_GTC_TTL_MS: Number(process.env.POLY_GTC_TTL_MS || 30000),
+  POLY_GTC_MAX_ATTEMPTS: Number(process.env.POLY_GTC_MAX_ATTEMPTS || 3),
+  POLY_GTC_POLL_MS: Number(process.env.POLY_GTC_POLL_MS || 800),
+  POLY_CANCEL_ON_NEW_BUCKET: String(process.env.POLY_CANCEL_ON_NEW_BUCKET || 'true').toLowerCase() === 'true',
+  POLY_FORCE_FILL: String(process.env.POLY_FORCE_FILL || 'false').toLowerCase() === 'true',
+  POLY_FORCE_FILL_PRICES: String(process.env.POLY_FORCE_FILL_PRICES || '0.60,0.70,0.80,0.90,0.95,0.99').trim(),
+  POLY_RECOVERY_MODE: String(process.env.POLY_RECOVERY_MODE || 'dynamic').trim().toLowerCase(),
+  POLY_TARGET_PROFIT_USD: Number(process.env.POLY_TARGET_PROFIT_USD || 1),
+  POLY_MIN_NOTIONAL_USD: Number(process.env.POLY_MIN_NOTIONAL_USD || 5),
+  POLY_MAX_NOTIONAL_USD_HARD: Number(process.env.POLY_MAX_NOTIONAL_USD_HARD || 160),
+  POLY_STATE_COLLECTION: String(process.env.POLY_STATE_COLLECTION || 'polymarketBotState').trim(),
 };
 
 const BAR_SEC = 300;
 const REQUIRED_CANDLES = 70;
+const LADDER = [5, 10, 20, 40, 80, 160];
 
 const state = {
   market: {
@@ -57,6 +72,8 @@ const state = {
     yesTokenId: ENV.POLY_YES_TOKEN_ID,
     noTokenId: ENV.POLY_NO_TOKEN_ID,
     orderMinSize: null,
+    conditionId: null,
+    takerBaseFee: null,
     loadedAtTs: null,
   },
   lastTradeBarClose: null,
@@ -65,6 +82,9 @@ const state = {
   lastDirection: 'FLAT',
   lastRun: null,
   autoSizeStep: 0,
+  pendingBets: [],
+  gtcOpenByToken: {},
+  gtcFilledByBucketTokenDecision: {},
 };
 
 const marketCache = {
@@ -73,6 +93,18 @@ const marketCache = {
 };
 
 const executeDedup = new Map();
+let firestoreClientPromise = null;
+
+const DEFAULT_EXECUTE_STATE = {
+  step: 0,
+  lossStreak: 0,
+  cumulativeLossUSD: 0,
+  lastBucketKeyPlaced: null,
+  filledBuckets: {},
+  pendingTrade: null,
+  pausedUntilBucket: null,
+  lastResolvedBucketKey: null,
+};
 
 function nowSec() {
   return Math.floor(Date.now() / 1000);
@@ -110,6 +142,12 @@ async function loadStateFromDisk() {
     state.positionUsd = safeNum(parsed.positionUsd, 0);
     state.lastDirection = String(parsed.lastDirection || 'FLAT');
     state.lastRun = parsed.lastRun && typeof parsed.lastRun === 'object' ? parsed.lastRun : null;
+    state.autoSizeStep = Math.max(0, Math.min(5, safeNum(parsed.autoSizeStep, 0)));
+    state.pendingBets = Array.isArray(parsed.pendingBets) ? parsed.pendingBets : [];
+    state.gtcOpenByToken = parsed.gtcOpenByToken && typeof parsed.gtcOpenByToken === 'object' ? parsed.gtcOpenByToken : {};
+    state.gtcFilledByBucketTokenDecision = parsed.gtcFilledByBucketTokenDecision && typeof parsed.gtcFilledByBucketTokenDecision === 'object'
+      ? parsed.gtcFilledByBucketTokenDecision
+      : {};
   } catch (_err) {
     // Optional persistence: ignore missing/corrupt state.
   }
@@ -122,6 +160,10 @@ async function saveStateToDisk() {
     positionUsd: state.positionUsd,
     lastDirection: state.lastDirection,
     lastRun: state.lastRun,
+    autoSizeStep: state.autoSizeStep,
+    pendingBets: state.pendingBets,
+    gtcOpenByToken: state.gtcOpenByToken,
+    gtcFilledByBucketTokenDecision: state.gtcFilledByBucketTokenDecision,
   };
   await fs.writeFile(STATE_FILE, JSON.stringify(payload, null, 2));
 }
@@ -133,6 +175,89 @@ async function fetchJson(url) {
     throw new Error(`HTTP ${resp.status} from ${url}: ${body.slice(0, 250)}`);
   }
   return resp.json();
+}
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+async function getFirestoreClient() {
+  if (firestoreClientPromise) return firestoreClientPromise;
+  firestoreClientPromise = (async () => {
+    const mod = await import('@google-cloud/firestore');
+    const Firestore = mod?.Firestore || mod?.default?.Firestore || mod?.default;
+    if (!Firestore) throw new Error('firestore_client_not_found');
+    return new Firestore();
+  })();
+  return firestoreClientPromise;
+}
+
+function executeStateDocId(envName, market) {
+  const m = String(market?.conditionId || market?.slug || 'unknown').replace(/[^a-zA-Z0-9:_-]/g, '_');
+  return `${String(envName || 'mainnet')}:${m}`;
+}
+
+async function loadExecuteState(envName, market) {
+  try {
+    const db = await getFirestoreClient();
+    const docId = executeStateDocId(envName, market);
+    const snap = await db.collection(ENV.POLY_STATE_COLLECTION).doc(docId).get();
+    if (!snap.exists) return { ...DEFAULT_EXECUTE_STATE, _docId: docId };
+    const data = snap.data() || {};
+    const filledRaw = data.filledBuckets && typeof data.filledBuckets === 'object' ? data.filledBuckets : {};
+    const filledBuckets = {};
+    for (const [k, v] of Object.entries(filledRaw)) {
+      if (v) filledBuckets[String(k)] = true;
+    }
+    let pendingTrade = data.pendingTrade && typeof data.pendingTrade === 'object' ? data.pendingTrade : null;
+    if (!pendingTrade && Array.isArray(data.openBets) && data.openBets.length) {
+      const legacy = data.openBets[0];
+      pendingTrade = {
+        bucketKey: Number.isFinite(Number(legacy?.bucketKey)) ? Number(legacy.bucketKey) : null,
+        marketSlug: String(legacy?.marketSlug || ''),
+        conditionId: String(legacy?.conditionId || ''),
+        tokenId: String(legacy?.tokenId || ''),
+        side: String(legacy?.decision || '').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP',
+        notionalUSD: Math.max(0, safeNum(legacy?.notionalUSD, 0)),
+        createdAtMs: Number.isFinite(Number(legacy?.placedAtMs)) ? Number(legacy.placedAtMs) : Date.now(),
+      };
+    }
+    return {
+      step: clamp(safeNum(data.step, 0), 0, 5),
+      lossStreak: Math.max(0, safeNum(data.lossStreak, 0)),
+      cumulativeLossUSD: Math.max(0, safeNum(data.cumulativeLossUSD, 0)),
+      lastBucketKeyPlaced: Number.isFinite(Number(data.lastBucketKeyPlaced)) ? Number(data.lastBucketKeyPlaced) : null,
+      filledBuckets,
+      pendingTrade,
+      pausedUntilBucket: Number.isFinite(Number(data.pausedUntilBucket)) ? Number(data.pausedUntilBucket) : null,
+      lastResolvedBucketKey: Number.isFinite(Number(data.lastResolvedBucketKey)) ? Number(data.lastResolvedBucketKey) : null,
+      _docId: docId,
+    };
+  } catch {
+    return { ...DEFAULT_EXECUTE_STATE, _docId: executeStateDocId(envName, market) };
+  }
+}
+
+async function saveExecuteState(execState) {
+  try {
+    const db = await getFirestoreClient();
+    const docId = String(execState?._docId || '');
+    if (!docId) return;
+    const payload = {
+      step: clamp(safeNum(execState.step, 0), 0, 5),
+      lossStreak: Math.max(0, safeNum(execState.lossStreak, 0)),
+      cumulativeLossUSD: Math.max(0, safeNum(execState.cumulativeLossUSD, 0)),
+      lastBucketKeyPlaced: Number.isFinite(Number(execState.lastBucketKeyPlaced)) ? Number(execState.lastBucketKeyPlaced) : null,
+      filledBuckets: execState.filledBuckets && typeof execState.filledBuckets === 'object' ? execState.filledBuckets : {},
+      pendingTrade: execState.pendingTrade && typeof execState.pendingTrade === 'object' ? execState.pendingTrade : null,
+      pausedUntilBucket: Number.isFinite(Number(execState.pausedUntilBucket)) ? Number(execState.pausedUntilBucket) : null,
+      lastResolvedBucketKey: Number.isFinite(Number(execState.lastResolvedBucketKey)) ? Number(execState.lastResolvedBucketKey) : null,
+      updatedAtMs: Date.now(),
+    };
+    await db.collection(ENV.POLY_STATE_COLLECTION).doc(docId).set(payload, { merge: true });
+  } catch {
+    // best effort persistence
+  }
 }
 
 async function fetchGeoblockStatus() {
@@ -201,6 +326,30 @@ function readOrderMinSize(market) {
   return null;
 }
 
+function readTakerBaseFee(market) {
+  const candidates = [
+    market?.takerBaseFee,
+    market?.taker_base_fee,
+    market?.takerFeeBps,
+    market?.taker_fee_bps,
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+  }
+  return null;
+}
+
+function readConditionId(market) {
+  const cid = String(
+    market?.conditionId
+    || market?.condition_id
+    || market?.questionID
+    || '',
+  ).trim();
+  return cid || null;
+}
+
 async function resolveUpDownMarket(marketSlug, nowMs = Date.now()) {
   const override = resolveEnvTokenOverrides();
   if (override) {
@@ -209,6 +358,8 @@ async function resolveUpDownMarket(marketSlug, nowMs = Date.now()) {
       yesTokenId: override.yesTokenId,
       noTokenId: override.noTokenId,
       orderMinSize: null,
+      conditionId: null,
+      takerBaseFee: null,
     }, nowMs);
   }
 
@@ -220,7 +371,14 @@ async function resolveUpDownMarket(marketSlug, nowMs = Date.now()) {
     const market = Array.isArray(payload) ? payload[0] : payload;
     if (!market || !market.slug) throw new Error(`market slug not found: ${marketSlug}`);
     const { yesTokenId, noTokenId } = extractUpDownTokens(market);
-    return cacheMarketEntry({ slug: String(market.slug), yesTokenId, noTokenId, orderMinSize: readOrderMinSize(market) }, nowMs);
+    return cacheMarketEntry({
+      slug: String(market.slug),
+      yesTokenId,
+      noTokenId,
+      orderMinSize: readOrderMinSize(market),
+      conditionId: readConditionId(market),
+      takerBaseFee: readTakerBaseFee(market),
+    }, nowMs);
   }
 
   if (marketCache.latestAuto && (nowMs - marketCache.latestAuto.cachedAtMs <= 20000)) {
@@ -235,6 +393,8 @@ async function resolveUpDownMarket(marketSlug, nowMs = Date.now()) {
     yesTokenId: selected.yesTokenId,
     noTokenId: selected.noTokenId,
     orderMinSize: readOrderMinSize(selected.market),
+    conditionId: readConditionId(selected.market),
+    takerBaseFee: readTakerBaseFee(selected.market),
   }, nowMs);
 }
 
@@ -275,6 +435,9 @@ async function resolveMarketTokens() {
       slug: ENV.POLY_MARKET_SLUG || 'manual',
       yesTokenId: override.yesTokenId,
       noTokenId: override.noTokenId,
+      orderMinSize: null,
+      conditionId: null,
+      takerBaseFee: null,
       loadedAtTs: nowSec(),
     };
     return state.market;
@@ -289,6 +452,9 @@ async function resolveMarketTokens() {
     slug: ENV.POLY_MARKET_SLUG,
     yesTokenId,
     noTokenId,
+    orderMinSize: readOrderMinSize(Array.isArray(payload) ? payload[0] : payload),
+    conditionId: readConditionId(Array.isArray(payload) ? payload[0] : payload),
+    takerBaseFee: readTakerBaseFee(Array.isArray(payload) ? payload[0] : payload),
     loadedAtTs: nowSec(),
   };
   return state.market;
@@ -482,14 +648,64 @@ function isLiveGateEnabled() {
 
 function computeExecuteSizing(requestNotionalUSD, marketOrderMinSize) {
   return computeExecuteNotional({
-    autoSize: ENV.POLY_AUTO_SIZE,
-    startNotionalUSD: ENV.POLY_START_NOTIONAL_USD,
-    sizeMult: ENV.POLY_SIZE_MULT,
-    maxNotionalUSD: ENV.POLY_MAX_NOTIONAL_USD,
+    autoSize: true,
+    startNotionalUSD: 1,
+    sizeMult: 2,
+    maxNotionalUSD: 32,
     step: state.autoSizeStep,
     requestNotionalUSD,
     orderMinSize: marketOrderMinSize,
   });
+}
+
+function deriveWinnerFromOutcomePrices(market) {
+  const outcomes = parseJsonArrayLike(market?.outcomes).map((x) => String(x || '').toLowerCase());
+  const prices = parseJsonArrayLike(market?.outcomePrices).map((x) => Number(x));
+  let upIdx = outcomes.indexOf('up');
+  let downIdx = outcomes.indexOf('down');
+  if (upIdx < 0 || downIdx < 0) {
+    upIdx = 0;
+    downIdx = 1;
+  }
+  const upP = Number(prices[upIdx]);
+  const downP = Number(prices[downIdx]);
+  if (!Number.isFinite(upP) || !Number.isFinite(downP)) return null;
+  if (upP === downP) return null;
+  return upP > downP ? 'UP' : 'DOWN';
+}
+
+async function reconcileSettledBets() {
+  if (!Array.isArray(state.pendingBets) || !state.pendingBets.length) return;
+  const pending = [...state.pendingBets];
+  const kept = [];
+  for (const bet of pending) {
+    const slug = String(bet?.marketSlug || '').trim();
+    if (!slug) continue;
+    try {
+      const payload = await fetchJson(`${ENV.POLY_GAMMA_HOST}/markets/slug/${encodeURIComponent(slug)}`);
+      const market = Array.isArray(payload) ? payload[0] : payload;
+      if (!market || !market.closed) {
+        kept.push(bet);
+        continue;
+      }
+      const winner = deriveWinnerFromOutcomePrices(market);
+      const decision = String(bet?.decision || '');
+      const notional = Number(bet?.notionalUSD || 0);
+      if (winner && decision) {
+        if (winner === decision) {
+          state.autoSizeStep = 0;
+        } else {
+          state.autoSizeStep = (state.autoSizeStep + 1) % 6;
+        }
+      }
+      if (Number.isFinite(notional) && notional > 0) {
+        state.positionUsd = Math.max(0, Number((state.positionUsd - notional).toFixed(6)));
+      }
+    } catch {
+      kept.push(bet);
+    }
+  }
+  state.pendingBets = kept;
 }
 
 function makeClientOrderId(slug, barCloseTs, direction) {
@@ -503,21 +719,403 @@ function buildOrderIntent(direction, yesTokenId, noTokenId) {
     : { side: 'BUY', tokenId: noTokenId, outcome: 'NO' };
 }
 
+function normalizeOrderPrice(midPrice) {
+  const p = Number(midPrice);
+  if (Number.isFinite(p) && p > 0 && p < 1) return p;
+  return 0.5;
+}
+
+function normalizeUsdAmount(amount) {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return NaN;
+  return Number((Math.max(0.01, n)).toFixed(2));
+}
+
+function floorToDecimals(value, decimals) {
+  const dec = Math.max(0, Number(decimals) || 0);
+  const raw = String(value ?? '').trim();
+  if (!raw) return '0';
+  const neg = raw.startsWith('-');
+  const normalized = raw.replace(/^[+-]/, '');
+  if (!/^\d+(\.\d+)?$/.test(normalized)) return '0';
+  const [intPartRaw, fracPartRaw = ''] = normalized.split('.');
+  const intPart = intPartRaw.replace(/^0+(?=\d)/, '') || '0';
+  const fracPart = fracPartRaw.padEnd(dec, '0').slice(0, dec);
+  let out = dec > 0 ? `${intPart}.${fracPart}` : intPart;
+  if (dec > 0) out = out.replace(/\.?0+$/, '');
+  if (!out) out = '0';
+  if (neg && out !== '0') return `-${out}`;
+  return out;
+}
+
+function applyMakerTakerPrecision(orderRequest) {
+  const makerWas = orderRequest?.makerAmount ?? null;
+  const takerWas = orderRequest?.takerAmount ?? orderRequest?.amount ?? null;
+  const makerAmount = floorToDecimals(makerWas ?? 0, 4);
+  const takerAmount = floorToDecimals(takerWas ?? 0, 2);
+  const next = {
+    ...orderRequest,
+    makerAmount,
+    takerAmount,
+    amount: Number(takerAmount),
+  };
+  return {
+    orderRequest: next,
+    precisionApplied: {
+      makerDecimals: 4,
+      takerDecimals: 2,
+      makerWas,
+      takerWas,
+    },
+  };
+}
+
+function countDecimals(value) {
+  const s = String(value ?? '').trim();
+  const m = s.match(/^-?\d+(?:\.(\d+))?$/);
+  if (!m) return 0;
+  return m[1] ? m[1].length : 0;
+}
+
+function isPositiveNumberLike(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0;
+}
+
+function tickDecimalsFromValue(tickSize) {
+  const raw = typeof tickSize === 'object' ? (tickSize?.minTickSize ?? tickSize?.tickSize ?? tickSize?.value ?? tickSize?.size) : tickSize;
+  const s = String(raw ?? '').trim();
+  if (!s) return 2;
+  const m = s.match(/^\d+(?:\.(\d+))?$/);
+  if (!m) return 2;
+  return Math.max(0, (m[1] || '').length);
+}
+
+function parseForceFillPriceSteps(midPrice) {
+  const base = normalizeOrderPrice(midPrice);
+  const fromEnv = String(ENV.POLY_FORCE_FILL_PRICES || '')
+    .split(',')
+    .map((x) => Number(String(x).trim()))
+    .filter((x) => Number.isFinite(x) && x > 0 && x < 1)
+    .map((x) => Number(x.toFixed(4)));
+  if (!fromEnv.length) return [base, 0.75, 0.85, 0.95, 0.99].map((x) => Number(x.toFixed(4)));
+  const uniqSorted = [...new Set(fromEnv)].sort((a, b) => a - b);
+  if (uniqSorted[0] > base) uniqSorted.unshift(Number(base.toFixed(4)));
+  return uniqSorted;
+}
+
+function resolveOrderType(mod, orderTypeName = ENV.POLY_ORDER_TYPE) {
+  const t = String(orderTypeName || 'FOK').toUpperCase();
+  if (t === 'FOK') return mod?.OrderType?.FOK || 'FOK';
+  if (t === 'GTD') return mod?.OrderType?.GTD || 'GTD';
+  return mod?.OrderType?.GTC || 'GTC';
+}
+
+function validateManualFeeRateOverride(rawFee) {
+  const raw = String(rawFee || '').trim();
+  if (!raw) return { hasOverride: false, feeRateBps: null };
+  if (!/^\d+$/.test(raw)) return { hasOverride: true, ok: false, reason: 'invalid_fee_rate' };
+  const feeRateBps = Number(raw);
+  if (!Number.isInteger(feeRateBps) || feeRateBps < 0 || feeRateBps > 200) {
+    return { hasOverride: true, ok: false, reason: 'invalid_fee_rate' };
+  }
+  return { hasOverride: true, ok: true, feeRateBps };
+}
+
+async function resolveDynamicFeeRateBps(client, conditionId, fallbackTakerBaseFee) {
+  const normalizeRawFeeToBps = (rawFee) => {
+    const raw = Number(rawFee);
+    if (!Number.isFinite(raw)) return null;
+    if (raw >= 0 && raw <= 1) return Math.round(raw * 10000);
+    if (raw > 1) return Math.floor(raw);
+    return null;
+  };
+
+  let feeRateBps = null;
+  if (conditionId && typeof client?.getMarket === 'function') {
+    try {
+      const m = await client.getMarket(conditionId);
+      feeRateBps = normalizeRawFeeToBps(m?.taker_base_fee ?? m?.takerBaseFee);
+      if (Number.isInteger(feeRateBps)) {
+        return { feeRateBps, feeSource: 'clob_market', feeRaw: m?.taker_base_fee ?? m?.takerBaseFee ?? null };
+      }
+    } catch {
+      feeRateBps = null;
+    }
+  }
+  feeRateBps = normalizeRawFeeToBps(fallbackTakerBaseFee);
+  if (Number.isInteger(feeRateBps)) return { feeRateBps, feeSource: 'gamma', feeRaw: fallbackTakerBaseFee ?? null };
+  return { feeRateBps: null, feeSource: null, feeRaw: null };
+}
+
+function feeLog({ rid: runRid, feeRateBps, tokenId }) {
+  console.log(`FEE: ${JSON.stringify({ rid: runRid, feeRateBps, tokenId })}`);
+}
+
+function sanitizeOrderRequest(orderRequest) {
+  const feeRaw = Number(orderRequest?.feeRateBps);
+  const makerAmount = orderRequest?.makerAmount ?? null;
+  const takerAmount = orderRequest?.takerAmount ?? orderRequest?.amount ?? null;
+  return {
+    tokenID: String(orderRequest?.tokenID || ''),
+    side: String(orderRequest?.side || ''),
+    amount: Number(orderRequest?.amount ?? NaN),
+    makerAmount: makerAmount == null ? null : String(makerAmount),
+    takerAmount: takerAmount == null ? null : String(takerAmount),
+    price: Number(orderRequest?.price ?? NaN),
+    feeRateBps: Number.isFinite(feeRaw) ? feeRaw : null,
+    orderType: String(orderRequest?.orderType || ''),
+  };
+}
+
+async function postMarketOrderWithClient(client, mod, orderRequest, orderTypeName = ENV.POLY_ORDER_TYPE) {
+  const orderType = resolveOrderType(mod, orderTypeName);
+  const { orderRequest: quantizedReq, precisionApplied } = applyMakerTakerPrecision(orderRequest);
+  const tickSize = typeof client.getTickSize === 'function'
+    ? await client.getTickSize(quantizedReq.tokenID).catch(() => undefined)
+    : undefined;
+  const postOrder = client.postOrder || client.createAndPostOrder || client.placeOrder;
+  const createOrder = client.createOrder;
+  if (typeof createOrder !== 'function' || typeof postOrder !== 'function') {
+    throw new Error('clob_create_order_method_not_found');
+  }
+
+  const priceDecimals = Math.max(2, tickDecimalsFromValue(tickSize));
+  const takerAmountFinal = floorToDecimals(quantizedReq.amount ?? 0, 2);
+  const priceFinal = floorToDecimals(quantizedReq.price ?? 0.5, priceDecimals);
+  const sizeRaw = Number(takerAmountFinal) / Number(priceFinal || '0');
+  const sizeFinal = floorToDecimals(sizeRaw, 4);
+  const feeRateBpsValue = Number.isInteger(quantizedReq.feeRateBps) ? quantizedReq.feeRateBps : undefined;
+
+  const userOrder = {
+    tokenID: String(quantizedReq.tokenID || ''),
+    side: quantizedReq.side,
+    price: Number(priceFinal),
+    size: Number(sizeFinal),
+    ...(Number.isInteger(feeRateBpsValue) ? { feeRateBps: feeRateBpsValue } : {}),
+  };
+
+  const precisionDetail = {
+    makerDecimals: 4,
+    takerDecimals: 2,
+    makerWas: quantizedReq.makerAmount ?? null,
+    takerWas: quantizedReq.takerAmount ?? quantizedReq.amount ?? null,
+    priceWas: quantizedReq.price ?? null,
+    sizeWas: sizeRaw,
+  };
+
+  if (!isPositiveNumberLike(userOrder.price) || !isPositiveNumberLike(userOrder.size) || !isPositiveNumberLike(takerAmountFinal)) {
+    return {
+      preflightFailed: true,
+      reason: 'amount_precision_preflight_failed',
+      precisionApplied: precisionDetail,
+      finalOrderRequest: {
+        ...quantizedReq,
+        price: Number(priceFinal),
+        size: Number(sizeFinal),
+        amount: Number(takerAmountFinal),
+        takerAmount: takerAmountFinal,
+      },
+      clobPayloadPosted: {
+        tokenId: userOrder.tokenID,
+        side: String(userOrder.side || ''),
+        price: priceFinal,
+        size: sizeFinal,
+        makerAmount: null,
+        takerAmount: takerAmountFinal,
+        orderType: String(orderType || ''),
+      },
+    };
+  }
+
+  const signedOrder = await createOrder.call(client, userOrder, tickSize);
+  const makerAmountFinal = floorToDecimals(signedOrder?.makerAmount, 4);
+  const takerAmountSignedFinal = floorToDecimals(signedOrder?.takerAmount, 2);
+  const makerOk = countDecimals(makerAmountFinal) <= 4 && isPositiveNumberLike(makerAmountFinal);
+  const takerOk = countDecimals(takerAmountSignedFinal) <= 2 && isPositiveNumberLike(takerAmountSignedFinal);
+  if (!makerOk || !takerOk) {
+    return {
+      preflightFailed: true,
+      reason: 'amount_precision_preflight_failed',
+      precisionApplied: precisionDetail,
+      finalOrderRequest: {
+        ...quantizedReq,
+        price: Number(priceFinal),
+        size: Number(sizeFinal),
+        amount: Number(takerAmountFinal),
+        makerAmount: makerAmountFinal,
+        takerAmount: takerAmountSignedFinal,
+      },
+      clobPayloadPosted: {
+        tokenId: String(signedOrder?.tokenId || userOrder.tokenID),
+        side: String(signedOrder?.side || userOrder.side || ''),
+        price: priceFinal,
+        size: sizeFinal,
+        makerAmount: makerAmountFinal,
+        takerAmount: takerAmountSignedFinal,
+        orderType: String(orderType || ''),
+      },
+    };
+  }
+
+  const result = await postOrder.call(client, signedOrder, orderType);
+  return {
+    result,
+    orderType,
+    precisionApplied: precisionDetail,
+    finalOrderRequest: {
+      ...quantizedReq,
+      price: Number(priceFinal),
+      size: Number(sizeFinal),
+      amount: Number(takerAmountFinal),
+      makerAmount: makerAmountFinal,
+      takerAmount: takerAmountSignedFinal,
+    },
+    makerAmountFinal,
+    takerAmountFinal: takerAmountSignedFinal,
+    priceFinal,
+    sizeFinal,
+    clobPayloadPosted: {
+      tokenId: String(signedOrder?.tokenId || userOrder.tokenID),
+      side: String(signedOrder?.side || userOrder.side || ''),
+      price: priceFinal,
+      size: sizeFinal,
+      makerAmount: makerAmountFinal,
+      takerAmount: takerAmountSignedFinal,
+      orderType: String(orderType || ''),
+    },
+  };
+}
+
+async function loadClobClient() {
+  const mod = await import('@polymarket/clob-client');
+  const walletMod = await import('@ethersproject/wallet');
+  const ClobClient = mod?.ClobClient || mod?.default?.ClobClient || mod?.default;
+  const Wallet = walletMod?.Wallet || walletMod?.default;
+  if (!ClobClient) throw new Error('clob_client_constructor_not_found');
+  if (!Wallet) throw new Error('ethers_wallet_constructor_not_found');
+
+  const signer = new Wallet(ENV.POLY_PRIVATE_KEY);
+  const client = new ClobClient(
+    ENV.POLY_CLOB_HOST,
+    137,
+    signer,
+    undefined,
+    resolveSignatureType(),
+    ENV.POLY_FUNDER_ADDRESS || undefined,
+  );
+  const maybeCreate = client.createOrDeriveApiKey || client.createApiKey || client.deriveApiKey;
+  if (typeof maybeCreate === 'function') {
+    const credsRaw = await maybeCreate.call(client);
+    if (credsRaw && typeof credsRaw === 'object') {
+      const normalized = {
+        key: credsRaw.key || credsRaw.apiKey || '',
+        secret: credsRaw.secret || '',
+        passphrase: credsRaw.passphrase || '',
+      };
+      if (normalized.key && normalized.secret && normalized.passphrase) client.creds = normalized;
+    }
+  }
+  return { client, mod };
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+function extractOrderId(result) {
+  const candidates = [
+    result?.orderID,
+    result?.orderId,
+    result?.id,
+    result?.data?.orderID,
+    result?.data?.orderId,
+    result?.data?.id,
+  ];
+  for (const c of candidates) {
+    const v = String(c || '').trim();
+    if (v) return v;
+  }
+  return null;
+}
+
+function normalizeOrderStatus(orderLike) {
+  const raw = String(
+    orderLike?.status
+    ?? orderLike?.orderStatus
+    ?? orderLike?.state
+    ?? '',
+  ).trim().toUpperCase();
+  if (!raw) return 'UNKNOWN';
+  if (raw.includes('FILL') || raw.includes('MATCH')) return 'FILLED';
+  if (raw.includes('CANCEL')) return 'CANCELED';
+  if (raw.includes('REJECT')) return 'REJECTED';
+  if (raw.includes('OPEN') || raw.includes('LIVE') || raw.includes('PENDING')) return 'OPEN';
+  return raw;
+}
+
+function makeFilledMarkerKey(bucketKey, tokenId, decision) {
+  return `${bucketKey}:${String(tokenId || '')}:${String(decision || '')}`;
+}
+
+async function fetchOrderStatus(client, orderId) {
+  const getOrder = client?.getOrder || client?.getOrderById || client?.fetchOrder;
+  if (typeof getOrder !== 'function') return null;
+  try {
+    const data = await getOrder.call(client, orderId);
+    return normalizeOrderStatus(data);
+  } catch {
+    return null;
+  }
+}
+
+async function cancelOrderById(client, orderId) {
+  const cands = [
+    client?.cancelOrder,
+    client?.cancel,
+    client?.cancelOrders,
+    client?.cancelOrderById,
+  ];
+  for (const fn of cands) {
+    if (typeof fn !== 'function') continue;
+    try {
+      if (fn === client?.cancelOrders) {
+        await fn.call(client, [orderId]);
+      } else {
+        await fn.call(client, orderId);
+      }
+      return true;
+    } catch {
+      // continue
+    }
+  }
+  return false;
+}
+
 function normalizeClobErrorReason(err) {
   const status = Number(
     err?.status
     ?? err?.response?.status
+    ?? err?.response?.statusCode
+    ?? err?.response?.data?.status
     ?? err?.data?.status
+    ?? err?.data?.statusCode
     ?? err?.result?.status
+    ?? err?.result?.statusCode
+    ?? err?.statusCode
     ?? NaN,
   );
-  const statusCode = Number.isFinite(status) ? Number(status) : null;
+  let statusCode = Number.isFinite(status) ? Number(status) : null;
 
   let safeMsg = '';
   if (typeof err?.data?.error === 'string' && err.data.error.trim()) safeMsg = err.data.error.trim();
   else if (typeof err?.error === 'string' && err.error.trim()) safeMsg = err.error.trim();
   else safeMsg = (err instanceof Error ? err.message : String(err || '')).trim();
   if (safeMsg.length > 160) safeMsg = safeMsg.slice(0, 160);
+  if (!Number.isFinite(statusCode)) {
+    const m = safeMsg.match(/\b([1-5][0-9]{2})\b/);
+    if (m) statusCode = Number(m[1]);
+  }
 
   const msg = safeMsg.toLowerCase();
   if (msg.includes('trading restricted in your region') || msg.includes('geoblock')) {
@@ -529,7 +1127,19 @@ function normalizeClobErrorReason(err) {
   if (msg.includes('api credentials are needed')) {
     return { reason: 'api_key_create_failed', upstreamStatus: statusCode ?? 400, upstreamMessage: 'api credentials are needed' };
   }
-  return { reason: 'clob_error', upstreamStatus: statusCode, upstreamMessage: safeMsg || 'unknown clob error' };
+  return {
+    reason: 'clob_error',
+    upstreamStatus: Number.isFinite(statusCode) ? statusCode : 500,
+    upstreamMessage: safeMsg || 'unknown clob error',
+  };
+}
+
+function extractRequiredFeeBpsFromMessage(message) {
+  const msg = String(message || '');
+  const m = msg.match(/taker fee:\s*([0-9]+)/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
 function computeRequestDryRun(mode) {
@@ -543,10 +1153,26 @@ function resolveSignatureType() {
   if (Number.isInteger(ENV.POLY_SIGNATURE_TYPE) && ENV.POLY_SIGNATURE_TYPE >= 0 && ENV.POLY_SIGNATURE_TYPE <= 2) {
     return ENV.POLY_SIGNATURE_TYPE;
   }
-  return ENV.POLY_FUNDER_ADDRESS ? 1 : 0;
+  return 0;
 }
 
-async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrderId, midPrice }) {
+async function resolveProofIdentityFields() {
+  const signatureType = resolveSignatureType();
+  let signerAddress = null;
+  if (ENV.POLY_PRIVATE_KEY) {
+    try {
+      const walletMod = await import('@ethersproject/wallet');
+      const Wallet = walletMod?.Wallet || walletMod?.default;
+      if (Wallet) signerAddress = new Wallet(ENV.POLY_PRIVATE_KEY).address;
+    } catch {
+      signerAddress = null;
+    }
+  }
+  const funderAddress = ENV.POLY_FUNDER_ADDRESS || signerAddress || null;
+  return { signerAddress, funderAddress, signatureType };
+}
+
+async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrderId, midPrice, runRid }) {
   const intent = buildOrderIntent(direction, yesTokenId, noTokenId);
   const amountUsd = ENV.POLY_ORDER_USD;
   if (ENV.POLY_DRY_RUN || ENV.POLY_KILL_SWITCH) {
@@ -589,29 +1215,72 @@ async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrder
       if (normalized.key && normalized.secret && normalized.passphrase) client.creds = normalized;
     }
   }
-
-  const orderPayload = {
-    tokenID: intent.tokenId,
-    side: intent.side,
-    orderType: 'MARKET',
-    amount: String(amountUsd),
-    clientOrderId,
-  };
-
-  const postOrder = client.postOrder || client.createAndPostOrder || client.placeOrder;
-  if (typeof postOrder !== 'function') {
-    throw new Error('clob_post_order_method_not_found');
+  const feeResolved = await resolveDynamicFeeRateBps(client, null, null);
+  if (!Number.isInteger(feeResolved.feeRateBps)) {
+    return {
+      skipped: true,
+      reason: 'fee_rate_unavailable',
+      upstreamMessage: 'fee not found in clob/gamma',
+      feeRateBpsUsed: null,
+      feeSource: null,
+      feeRaw: null,
+      orderRequest: sanitizeOrderRequest({
+        tokenID: intent.tokenId,
+        side: 'BUY',
+        amount: Number(amountUsd),
+        price: normalizeOrderPrice(midPrice),
+        feeRateBps: null,
+        orderType: ENV.POLY_ORDER_TYPE,
+      }),
+      intent: { ...intent, amountUsd, clientOrderId, midPrice },
+    };
   }
-
-  const result = await postOrder.call(client, orderPayload);
+  feeLog({ rid: runRid, feeRateBps: feeResolved.feeRateBps, tokenId: intent.tokenId });
+  const orderRequest = {
+    tokenID: intent.tokenId,
+    side: 'BUY',
+    amount: Number(amountUsd),
+    price: normalizeOrderPrice(midPrice),
+    feeRateBps: feeResolved.feeRateBps,
+  };
+  const posted = await postMarketOrderWithClient(client, mod, orderRequest);
+  if (posted?.preflightFailed) {
+    return {
+      skipped: true,
+      reason: posted.reason || 'amount_precision_preflight_failed',
+      orderRequest: sanitizeOrderRequest(posted.finalOrderRequest || orderRequest),
+      precisionApplied: posted.precisionApplied || null,
+      clobPayloadPosted: posted.clobPayloadPosted || null,
+      intent: { ...intent, amountUsd, clientOrderId, midPrice },
+    };
+  }
+  const { result, orderType, finalOrderRequest, precisionApplied } = posted;
   return {
     skipped: false,
     result,
-    intent: { ...intent, amountUsd, clientOrderId, midPrice },
+    intent: { ...intent, amountUsd, clientOrderId, midPrice, orderType },
+    feeRateBpsUsed: feeResolved.feeRateBps,
+    feeSource: feeResolved.feeSource,
+    feeRaw: feeResolved.feeRaw ?? null,
+    orderRequest: sanitizeOrderRequest({ ...(finalOrderRequest || orderRequest), orderType }),
+    precisionApplied,
   };
 }
 
-async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId, mode, dryRun, midPrice }) {
+async function placeOutcomeOrder({
+  outcome,
+  tokenId,
+  notionalUSD,
+  clientOrderId,
+  mode,
+  dryRun,
+  midPrice,
+  runRid,
+  decision,
+  bucketKey,
+  conditionId,
+  fallbackTakerBaseFee,
+}) {
   if (mode === 'test') {
     return {
       skipped: true,
@@ -620,18 +1289,17 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
     };
   }
 
-  if (mode === 'live' && !isLiveGateEnabled()) {
+  if (mode === 'live' && dryRun) {
     return {
       skipped: true,
-      reason: 'live_not_enabled',
+      reason: 'dry_run_gate',
       intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
-
-  if (dryRun || ENV.POLY_KILL_SWITCH) {
+  if (ENV.POLY_KILL_SWITCH) {
     return {
       skipped: true,
-      reason: ENV.POLY_KILL_SWITCH ? 'kill_switch' : 'dry_run',
+      reason: 'kill_switch',
       intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
@@ -644,6 +1312,17 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
     };
   }
 
+  const feeOverride = validateManualFeeRateOverride(ENV.POLY_FEE_RATE_BPS_RAW);
+  if (feeOverride.hasOverride && feeOverride.ok === false) {
+    const parsedRaw = Number(ENV.POLY_FEE_RATE_BPS_RAW);
+    feeLog({ rid: runRid, feeRateBps: Number.isFinite(parsedRaw) ? Math.floor(parsedRaw) : null, tokenId });
+    return {
+      skipped: true,
+      reason: 'invalid_fee_rate',
+      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+    };
+  }
+
   const geo = await fetchGeoblockStatus();
   if (geo?.blocked) {
     const detail = [geo.country, geo.region].filter(Boolean).join('/');
@@ -652,74 +1331,354 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
       reason: 'geoblock',
       upstreamStatus: 403,
       upstreamMessage: detail ? `trading restricted in your region (${detail})` : 'trading restricted in your region',
+      geo,
       intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
 
   try {
-    const mod = await import('@polymarket/clob-client');
-    const walletMod = await import('@ethersproject/wallet');
-    const ClobClient = mod?.ClobClient || mod?.default?.ClobClient || mod?.default;
-    const Wallet = walletMod?.Wallet || walletMod?.default;
-    if (!ClobClient) throw new Error('clob_client_constructor_not_found');
-    if (!Wallet) throw new Error('ethers_wallet_constructor_not_found');
+    const { client, mod } = await loadClobClient();
 
-    const signer = new Wallet(ENV.POLY_PRIVATE_KEY);
-    const client = new ClobClient(
-      ENV.POLY_CLOB_HOST,
-      137,
-      signer,
-      undefined,
-      resolveSignatureType(),
-      ENV.POLY_FUNDER_ADDRESS || undefined,
-    );
-    const maybeCreate = client.createOrDeriveApiKey || client.createApiKey || client.deriveApiKey;
-    if (typeof maybeCreate === 'function') {
-      const credsRaw = await maybeCreate.call(client);
-      if (credsRaw && typeof credsRaw === 'object') {
-        const normalized = {
-          key: credsRaw.key || credsRaw.apiKey || '',
-          secret: credsRaw.secret || '',
-          passphrase: credsRaw.passphrase || '',
-        };
-        if (normalized.key && normalized.secret && normalized.passphrase) client.creds = normalized;
-      }
+    const amountUsdNum = normalizeUsdAmount(notionalUSD);
+    if (!Number.isFinite(amountUsdNum) || amountUsdNum <= 0) throw new Error('invalid_notional_usd');
+
+    const configuredOrderType = String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase();
+    const canUseClientConvenience = typeof client.createAndPostMarketOrder === 'function';
+    const feeResolved = feeOverride.hasOverride
+      ? { feeRateBps: feeOverride.feeRateBps, feeSource: 'override', feeRaw: feeOverride.feeRateBps }
+      : (canUseClientConvenience
+        ? { feeRateBps: null, feeSource: 'client', feeRaw: null }
+        : await resolveDynamicFeeRateBps(client, conditionId, fallbackTakerBaseFee));
+    const feeRateBps = feeResolved.feeRateBps;
+    const feeSource = feeResolved.feeSource;
+    const feeRaw = feeResolved.feeRaw ?? null;
+    if (!canUseClientConvenience && !Number.isInteger(feeRateBps)) {
+      return {
+        skipped: true,
+        reason: 'fee_rate_unavailable',
+        upstreamMessage: 'fee not found in clob/gamma',
+        feeRateBpsUsed: null,
+        feeSource: null,
+        feeRaw: null,
+        orderRequest: sanitizeOrderRequest({
+          tokenID: tokenId,
+          side: 'BUY',
+          amount: amountUsdNum,
+          price: normalizeOrderPrice(midPrice),
+          feeRateBps: null,
+          orderType: ENV.POLY_ORDER_TYPE,
+        }),
+        intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      };
     }
+    feeLog({ rid: runRid, feeRateBps, tokenId });
 
-    const orderPayload = {
+    const baseOrderRequest = {
       tokenID: tokenId,
       side: 'BUY',
-      orderType: 'MARKET',
-      amount: String(notionalUSD),
-      clientOrderId,
+      amount: amountUsdNum,
     };
-    const postOrder = client.postOrder || client.createAndPostOrder || client.placeOrder;
-    if (typeof postOrder !== 'function') throw new Error('clob_post_order_method_not_found');
+    const price = normalizeOrderPrice(midPrice);
+    const orderRequest = feeOverride.hasOverride
+      ? { ...baseOrderRequest, price, feeRateBps }
+      : (canUseClientConvenience ? baseOrderRequest : { ...baseOrderRequest, price, feeRateBps });
 
-    const result = await postOrder.call(client, orderPayload);
+    if (configuredOrderType === 'GTC') {
+      const ttlMs = Math.max(1000, Number(ENV.POLY_GTC_TTL_MS) || 30000);
+      const maxAttempts = Math.max(1, Number(ENV.POLY_GTC_MAX_ATTEMPTS) || 3);
+      const pollMs = Math.max(200, Number(ENV.POLY_GTC_POLL_MS) || 800);
+      const forceFillSteps = ENV.POLY_FORCE_FILL ? parseForceFillPriceSteps(midPrice) : [];
+      const effectiveAttempts = Math.max(maxAttempts, forceFillSteps.length || 0);
+      const previousOpen = state.gtcOpenByToken[tokenId];
+      if (previousOpen && previousOpen.orderId) {
+        const prevBucket = Number(previousOpen.bucketKey);
+        const shouldCancel = !Number.isFinite(prevBucket)
+          || prevBucket !== bucketKey
+          || ENV.POLY_CANCEL_ON_NEW_BUCKET;
+        if (shouldCancel) {
+          await cancelOrderById(client, previousOpen.orderId);
+          delete state.gtcOpenByToken[tokenId];
+        }
+      }
+
+      let lastOrderId = null;
+      let lastStatus = 'UNKNOWN';
+      for (let attemptCount = 1; attemptCount <= effectiveAttempts; attemptCount += 1) {
+        if (state.gtcOpenByToken[tokenId]?.orderId) {
+          await cancelOrderById(client, state.gtcOpenByToken[tokenId].orderId);
+          delete state.gtcOpenByToken[tokenId];
+        }
+        const attemptPrice = (ENV.POLY_FORCE_FILL && !canUseClientConvenience)
+          ? (forceFillSteps[Math.min(attemptCount - 1, forceFillSteps.length - 1)] || 0.99)
+          : null;
+        const attemptOrderRequest = (ENV.POLY_FORCE_FILL && !canUseClientConvenience)
+          ? { ...orderRequest, price: Number(attemptPrice.toFixed(4)) }
+          : orderRequest;
+        const posted = await postMarketOrderWithClient(client, mod, attemptOrderRequest, 'GTC');
+        if (posted?.preflightFailed) {
+          return {
+            skipped: true,
+            reason: posted.reason || 'amount_precision_preflight_failed',
+            feeRateBpsUsed: feeRateBps,
+            feeSource,
+            feeRaw,
+            orderType: 'GTC',
+            bucketKey,
+            attemptCount,
+            ttlMs,
+            status: 'REJECTED',
+            orderRequest: sanitizeOrderRequest(posted.finalOrderRequest || attemptOrderRequest),
+            precisionApplied: posted.precisionApplied || null,
+            clobPayloadPosted: posted.clobPayloadPosted || null,
+            ...(geo ? { geo } : {}),
+            intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+          };
+        }
+        const { result, orderType, finalOrderRequest, precisionApplied } = posted;
+        if (result?.error) {
+          const mapped = normalizeClobErrorReason(result.error);
+          return {
+            skipped: true,
+            reason: mapped.reason,
+            upstreamStatus: mapped.upstreamStatus,
+            upstreamMessage: mapped.upstreamMessage,
+            feeRateBpsUsed: feeRateBps,
+            feeSource,
+            feeRaw,
+            orderType: 'GTC',
+            bucketKey,
+            attemptCount,
+            ttlMs,
+            status: 'REJECTED',
+            orderRequest: sanitizeOrderRequest({ ...(finalOrderRequest || attemptOrderRequest), orderType: 'GTC' }),
+            precisionApplied,
+            clobPayloadPosted: posted.clobPayloadPosted || null,
+            ...(geo ? { geo } : {}),
+            intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+            result,
+          };
+        }
+
+        const orderId = extractOrderId(result);
+        const initialStatus = normalizeOrderStatus(result);
+        lastOrderId = orderId;
+        lastStatus = initialStatus;
+        if (orderId) {
+          state.gtcOpenByToken[tokenId] = { orderId, bucketKey, decision };
+        }
+
+        if (initialStatus === 'FILLED') {
+          delete state.gtcOpenByToken[tokenId];
+          return {
+            skipped: false,
+            feeRateBpsUsed: feeRateBps,
+            feeSource,
+            feeRaw,
+            orderType: 'GTC',
+            bucketKey,
+            attemptCount,
+            ttlMs,
+            orderId,
+            status: 'FILLED',
+            filled: true,
+            orderRequest: sanitizeOrderRequest({ ...(finalOrderRequest || attemptOrderRequest), orderType: 'GTC' }),
+            precisionApplied,
+            clobPayloadPosted: posted.clobPayloadPosted || null,
+            ...(geo ? { geo } : {}),
+            result,
+            intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType },
+          };
+        }
+
+        const startedMs = Date.now();
+        while ((Date.now() - startedMs) < ttlMs) {
+          await sleepMs(pollMs);
+          if (!orderId) break;
+          const polledStatus = await fetchOrderStatus(client, orderId);
+          if (!polledStatus) continue;
+          lastStatus = polledStatus;
+          if (polledStatus === 'FILLED') {
+            delete state.gtcOpenByToken[tokenId];
+            return {
+              skipped: false,
+              feeRateBpsUsed: feeRateBps,
+              feeSource,
+              feeRaw,
+              orderType: 'GTC',
+              bucketKey,
+              attemptCount,
+              ttlMs,
+              orderId,
+              status: 'FILLED',
+              filled: true,
+              orderRequest: sanitizeOrderRequest({ ...(finalOrderRequest || attemptOrderRequest), orderType: 'GTC' }),
+              precisionApplied,
+              clobPayloadPosted: posted.clobPayloadPosted || null,
+              ...(geo ? { geo } : {}),
+              result,
+              intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType },
+            };
+          }
+        }
+
+        const isLastAttempt = attemptCount >= effectiveAttempts;
+        if (orderId && !(ENV.POLY_FORCE_FILL && isLastAttempt)) {
+          await cancelOrderById(client, orderId);
+          delete state.gtcOpenByToken[tokenId];
+        }
+      }
+
+      if (ENV.POLY_FORCE_FILL && lastOrderId) {
+        state.gtcOpenByToken[tokenId] = { orderId: lastOrderId, bucketKey, decision };
+        return {
+          skipped: true,
+          reason: 'open_wait_fill_force_fill',
+          feeRateBpsUsed: feeRateBps,
+          feeSource,
+          feeRaw,
+          orderType: 'GTC',
+          bucketKey,
+          attemptCount: effectiveAttempts,
+          ttlMs,
+          orderId: lastOrderId,
+          status: lastStatus || 'OPEN',
+          filled: false,
+          orderRequest: sanitizeOrderRequest({ ...orderRequest, orderType: 'GTC' }),
+          precisionApplied: { makerDecimals: 4, takerDecimals: 2, makerWas: null, takerWas: orderRequest?.amount ?? null },
+          clobPayloadPosted: null,
+          ...(geo ? { geo } : {}),
+          intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+        };
+      }
+
+      return {
+        skipped: true,
+        reason: 'gtc_unfilled_after_retries',
+        feeRateBpsUsed: feeRateBps,
+        feeSource,
+        feeRaw,
+        orderType: 'GTC',
+        bucketKey,
+        attemptCount: effectiveAttempts,
+        ttlMs,
+        ...(lastOrderId ? { orderId: lastOrderId } : {}),
+        status: lastStatus || 'CANCELED',
+        filled: false,
+        orderRequest: sanitizeOrderRequest({ ...orderRequest, orderType: 'GTC' }),
+        precisionApplied: { makerDecimals: 4, takerDecimals: 2, makerWas: null, takerWas: orderRequest?.amount ?? null },
+        clobPayloadPosted: null,
+        ...(geo ? { geo } : {}),
+        intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      };
+    }
+
+    const posted = await postMarketOrderWithClient(client, mod, orderRequest, configuredOrderType);
+    if (posted?.preflightFailed) {
+      return {
+        skipped: true,
+        reason: posted.reason || 'amount_precision_preflight_failed',
+        feeRateBpsUsed: feeRateBps,
+        feeSource,
+        feeRaw,
+        orderType: configuredOrderType,
+        bucketKey,
+        attemptCount: 1,
+        ttlMs: null,
+        orderRequest: sanitizeOrderRequest(posted.finalOrderRequest || orderRequest),
+        precisionApplied: posted.precisionApplied || null,
+        clobPayloadPosted: posted.clobPayloadPosted || null,
+        ...(geo ? { geo } : {}),
+        intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      };
+    }
+    const { result, orderType, finalOrderRequest, precisionApplied } = posted;
     if (result?.error) {
       const mapped = normalizeClobErrorReason(result.error);
+      const requiredFeeBps = extractRequiredFeeBpsFromMessage(mapped.upstreamMessage);
+      if (configuredOrderType === 'FOK' && mapped.reason === 'clob_error' && Number.isInteger(requiredFeeBps) && requiredFeeBps > 0) {
+        const retryRequest = { ...orderRequest, feeRateBps: requiredFeeBps };
+        feeLog({ rid: runRid, feeRateBps: requiredFeeBps, tokenId });
+        const retried = await postMarketOrderWithClient(client, mod, retryRequest, configuredOrderType);
+        if (!retried?.result?.error) {
+          return {
+            skipped: false,
+            feeRateBpsUsed: requiredFeeBps,
+            feeSource: 'clob_market',
+            orderType: configuredOrderType,
+            bucketKey,
+            attemptCount: 1,
+            ttlMs: null,
+            orderRequest: sanitizeOrderRequest({ ...(retried.finalOrderRequest || retryRequest), orderType: retried.orderType }),
+            precisionApplied: retried.precisionApplied,
+            clobPayloadPosted: retried.clobPayloadPosted || null,
+            ...(geo ? { geo } : {}),
+            result: retried.result,
+            intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType: retried.orderType },
+          };
+        }
+      }
       return {
         skipped: true,
         reason: mapped.reason,
         upstreamStatus: mapped.upstreamStatus,
         upstreamMessage: mapped.upstreamMessage,
+        feeRateBpsUsed: feeRateBps,
+        feeSource,
+        feeRaw,
+        orderType: configuredOrderType,
+        bucketKey,
+        attemptCount: 1,
+        ttlMs: null,
+        orderRequest: sanitizeOrderRequest({ ...(finalOrderRequest || orderRequest), orderType }),
+        precisionApplied,
+        clobPayloadPosted: posted.clobPayloadPosted || null,
+        ...(geo ? { geo } : {}),
         intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
         result,
       };
     }
     return {
       skipped: false,
+      feeRateBpsUsed: feeRateBps,
+      feeSource,
+      feeRaw,
+      orderType: configuredOrderType,
+      bucketKey,
+      attemptCount: 1,
+      ttlMs: null,
+      orderRequest: sanitizeOrderRequest({ ...(finalOrderRequest || orderRequest), orderType }),
+      precisionApplied,
+      clobPayloadPosted: posted.clobPayloadPosted || null,
+      ...(geo ? { geo } : {}),
       result,
-      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType },
     };
   } catch (err) {
     const mapped = normalizeClobErrorReason(err);
+    const precisionSeed = applyMakerTakerPrecision({
+      tokenID: String(tokenId || ''),
+      side: 'BUY',
+      amount: Number(notionalUSD ?? NaN),
+      price: normalizeOrderPrice(midPrice),
+      feeRateBps: Number.isInteger(feeOverride?.feeRateBps) ? feeOverride.feeRateBps : 0,
+      orderType: ENV.POLY_ORDER_TYPE,
+    });
     return {
       skipped: true,
       reason: mapped.reason,
       upstreamStatus: mapped.upstreamStatus,
       upstreamMessage: mapped.upstreamMessage,
+      orderRequest: sanitizeOrderRequest(precisionSeed.orderRequest),
+      precisionApplied: precisionSeed.precisionApplied,
+      clobPayloadPosted: null,
+      feeRateBpsUsed: Number.isInteger(feeOverride?.feeRateBps) ? feeOverride.feeRateBps : 0,
+      feeSource: Number.isInteger(feeOverride?.feeRateBps) ? 'override' : 'default_zero',
+      feeRaw: Number.isInteger(feeOverride?.feeRateBps) ? feeOverride.feeRateBps : null,
+      orderType: String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
+      bucketKey,
+      attemptCount: 1,
+      ttlMs: null,
+      ...(geo ? { geo } : {}),
       intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
@@ -731,6 +1690,93 @@ function tickLog(line) {
 
 function decisionLog(line) {
   console.log('DECISION:', JSON.stringify(line));
+}
+
+function normalizeExecState(execState) {
+  const filledRaw = execState?.filledBuckets && typeof execState.filledBuckets === 'object' ? execState.filledBuckets : {};
+  const filledBuckets = {};
+  for (const [k, v] of Object.entries(filledRaw)) {
+    if (v) filledBuckets[String(k)] = true;
+  }
+  let pendingTrade = execState?.pendingTrade && typeof execState.pendingTrade === 'object' ? execState.pendingTrade : null;
+  if (!pendingTrade && Array.isArray(execState?.openBets) && execState.openBets.length) {
+    const legacy = execState.openBets[0];
+    pendingTrade = {
+      bucketKey: Number.isFinite(Number(legacy?.bucketKey)) ? Number(legacy.bucketKey) : null,
+      marketSlug: String(legacy?.marketSlug || ''),
+      conditionId: String(legacy?.conditionId || ''),
+      tokenId: String(legacy?.tokenId || ''),
+      side: String(legacy?.decision || '').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP',
+      notionalUSD: Math.max(0, safeNum(legacy?.notionalUSD, 0)),
+      createdAtMs: Number.isFinite(Number(legacy?.placedAtMs)) ? Number(legacy.placedAtMs) : Date.now(),
+    };
+  }
+  return {
+    ...DEFAULT_EXECUTE_STATE,
+    ...execState,
+    step: clamp(safeNum(execState?.step, 0), 0, LADDER.length - 1),
+    lossStreak: Math.max(0, safeNum(execState?.lossStreak, 0)),
+    cumulativeLossUSD: Math.max(0, safeNum(execState?.cumulativeLossUSD, 0)),
+    lastBucketKeyPlaced: Number.isFinite(Number(execState?.lastBucketKeyPlaced)) ? Number(execState.lastBucketKeyPlaced) : null,
+    lastResolvedBucketKey: Number.isFinite(Number(execState?.lastResolvedBucketKey)) ? Number(execState.lastResolvedBucketKey) : null,
+    pausedUntilBucket: Number.isFinite(Number(execState?.pausedUntilBucket)) ? Number(execState.pausedUntilBucket) : null,
+    filledBuckets,
+    pendingTrade,
+  };
+}
+
+async function reconcileExecuteState(execState, currentBucketKey) {
+  const next = normalizeExecState(execState);
+  const pending = next.pendingTrade;
+  if (!pending) return { state: next, reconcileReason: null, pendingResolved: false };
+
+  const pendingBucket = Number(pending?.bucketKey);
+  const pendingSlug = String(pending?.marketSlug || '').trim();
+  if (!Number.isFinite(pendingBucket) || !pendingSlug || pendingBucket >= currentBucketKey) {
+    return { state: next, reconcileReason: null, pendingResolved: false };
+  }
+
+  try {
+    const payload = await fetchJson(`${ENV.POLY_GAMMA_HOST}/markets/slug/${encodeURIComponent(pendingSlug)}`);
+    const market = Array.isArray(payload) ? payload[0] : payload;
+    if (!market || !market.closed) {
+      return { state: next, reconcileReason: null, pendingResolved: false };
+    }
+    const winner = deriveWinnerFromOutcomePrices(market);
+    if (!winner || (winner !== 'UP' && winner !== 'DOWN')) {
+      return { state: next, reconcileReason: 'reconcile_unavailable', pendingResolved: false };
+    }
+
+    const settled = applySettlementOutcome(next, pending, winner, currentBucketKey, LADDER.length - 1);
+    return { state: settled.state, reconcileReason: settled.reason, pendingResolved: true };
+  } catch {
+    return { state: next, reconcileReason: 'reconcile_unavailable', pendingResolved: false };
+  }
+}
+
+function computeRecoverySizing({ execState, marketOrderMinSize, forceBaseStake = false }) {
+  const normalized = normalizeExecState(execState);
+  const step = clamp(safeNum(normalized.step, 0), 0, LADDER.length - 1);
+  const ladderNotional = forceBaseStake ? LADDER[0] : (LADDER[step] || LADDER[0]);
+  const minFromEnv = Math.max(0.01, safeNum(ENV.POLY_MIN_NOTIONAL_USD, 5));
+  const minFromMarket = Number.isFinite(Number(marketOrderMinSize)) && Number(marketOrderMinSize) > 0
+    ? Number(marketOrderMinSize)
+    : 0;
+  const minNotional = Math.max(5, minFromEnv, minFromMarket);
+  const maxNotional = Math.max(minNotional, safeNum(ENV.POLY_MAX_NOTIONAL_USD_HARD, 160));
+  let computedNotionalUSD = clamp(ladderNotional, minNotional, maxNotional);
+  const adjustedToMin = computedNotionalUSD > ladderNotional;
+  return {
+    step,
+    ladderNotional,
+    computedNotionalUSD: Number(computedNotionalUSD.toFixed(6)),
+    minNotional,
+    maxNotional,
+    adjustedToMin,
+    belowMinSize: computedNotionalUSD < minNotional,
+    recoveryUnreachable: false,
+    reason: null,
+  };
 }
 
 async function runTick(reqRid) {
@@ -826,6 +1872,7 @@ async function runTick(reqRid) {
       noTokenId: market.noTokenId,
       clientOrderId,
       midPrice: midpoint,
+      runRid,
     });
     if (!order.skipped) {
       tradeExecuted = true;
@@ -899,15 +1946,37 @@ async function runExecute(body, requestRid) {
   }
 
   const req = parsed.value;
-  const requestDryRun = computeRequestDryRun(req.mode);
+  const requestDryRun = computeRequestDryRun(req.mode) || ENV.POLY_KILL_SWITCH;
+  const proofIdentity = await resolveProofIdentityFields();
   const quorum = computeQuorumDecision(req.votes, req.minAgree);
   const decision = quorum.decision;
   const outcome = decision === 'UP' ? 'Up' : decision === 'DOWN' ? 'Down' : null;
   const intervalKey = intervalKeyFromTsMs(req.ts);
+  const bucketKey = intervalKey;
 
   const market = await resolveUpDownMarket(req.marketSlug, nowMs);
   const tokenId = decision === 'UP' ? market.yesTokenId : decision === 'DOWN' ? market.noTokenId : null;
-  const sizing = computeExecuteSizing(req.notionalUSD, market.orderMinSize);
+  let execState = normalizeExecState(await loadExecuteState(req.env, market));
+  const reconcile = await reconcileExecuteState(execState, bucketKey);
+  execState = normalizeExecState(reconcile.state);
+  const hasPendingUnresolved = Boolean(execState.pendingTrade);
+  const preMidPrice = tokenId ? await fetchMidpoint(tokenId).catch(() => null) : null;
+  const sizing = computeRecoverySizing({
+    execState,
+    marketOrderMinSize: market.orderMinSize,
+    forceBaseStake: hasPendingUnresolved,
+  });
+  const pendingSummary = execState.pendingTrade
+    ? {
+      bucketKey: Number.isFinite(Number(execState.pendingTrade.bucketKey)) ? Number(execState.pendingTrade.bucketKey) : null,
+      marketSlug: String(execState.pendingTrade.marketSlug || ''),
+      conditionId: String(execState.pendingTrade.conditionId || ''),
+      tokenId: String(execState.pendingTrade.tokenId || ''),
+      side: String(execState.pendingTrade.side || ''),
+      notionalUSD: Math.max(0, safeNum(execState.pendingTrade.notionalUSD, 0)),
+      createdAtMs: Number.isFinite(Number(execState.pendingTrade.createdAtMs)) ? Number(execState.pendingTrade.createdAtMs) : null,
+    }
+    : null;
 
   const base = {
     ok: true,
@@ -918,18 +1987,30 @@ async function runExecute(body, requestRid) {
     outcome,
     tokenId,
     voteCounts: quorum.counts,
-    voteSummary: quorum.voteSummary,
-    intervalKey,
-    mode: req.mode,
-    dryRun: requestDryRun,
-    killSwitch: ENV.POLY_KILL_SWITCH,
+      voteSummary: quorum.voteSummary,
+      intervalKey,
+      bucketKey,
+      mode: req.mode,
+      dryRun: requestDryRun,
+      killSwitch: ENV.POLY_KILL_SWITCH,
+    signerAddress: proofIdentity.signerAddress,
+    funderAddress: proofIdentity.funderAddress,
+    signatureType: proofIdentity.signatureType,
+    computedNotionalUSD: sizing.computedNotionalUSD,
+    step: sizing.step,
+    lossStreak: Math.max(0, safeNum(execState.lossStreak, 0)),
+    cumulativeLossUSD: Math.max(0, safeNum(execState.cumulativeLossUSD, 0)),
+    pendingTrade: pendingSummary,
     sizing: {
-      auto: sizing.auto,
+      auto: false,
       step: sizing.step,
       computedNotionalUSD: sizing.computedNotionalUSD,
-      max: sizing.max,
+      max: sizing.maxNotional,
+      min: sizing.minNotional,
       adjustedToMin: sizing.adjustedToMin,
-      orderMinSize: sizing.orderMinSize,
+      orderMinSize: market.orderMinSize,
+      ladderNotional: sizing.ladderNotional,
+      dynamicNotional: Number.isFinite(sizing.dynamicNotional) ? Number(sizing.dynamicNotional.toFixed(6)) : null,
     },
   };
 
@@ -937,14 +2018,28 @@ async function runExecute(body, requestRid) {
     decisionLog({
       rid: requestRid,
       marketSlug: market.slug,
+      bucketKey,
       decision,
       mode: req.mode,
       dryRun: resp?.dryRun,
       tradeExecuted: Boolean(resp?.tradeExecuted),
       deduped: Boolean(resp?.deduped),
       reason: resp?.reason,
+      orderType: resp?.orderType ?? null,
+      attemptCount: Number.isFinite(resp?.attemptCount) ? resp.attemptCount : null,
       upstreamStatus: resp?.upstreamStatus ?? null,
+      feeSource: resp?.feeSource ?? null,
+      feeRateBpsUsed: Number.isInteger(resp?.feeRateBpsUsed) ? resp.feeRateBpsUsed : null,
+      makerAmountFinal: resp?.makerAmountFinal ?? null,
+      takerAmountFinal: resp?.takerAmountFinal ?? null,
+      priceFinal: resp?.priceFinal ?? null,
+      sizeFinal: resp?.sizeFinal ?? null,
+      precisionApplied: Boolean(resp?.precisionApplied),
       computedNotionalUSD: sizing.computedNotionalUSD,
+      step: base.step,
+      lossStreak: base.lossStreak,
+      cumulativeLossUSD: base.cumulativeLossUSD,
+      geoBlocked: resp?.geo?.blocked ?? null,
     });
   };
 
@@ -952,37 +2047,56 @@ async function runExecute(body, requestRid) {
     const resp = {
       ...base,
       deduped: false,
-      reason: 'no_quorum',
+      reason: reconcile.reconcileReason === 'max_step_reached_reset_pause' ? 'max_step_reached_reset_pause' : 'no_quorum',
       tokenId: null,
       tradeExecuted: false,
     };
     state.lastRun = resp;
     await saveStateToDisk().catch(() => {});
+    await saveExecuteState(execState);
     logDecision(resp);
     return resp;
   }
 
-  purgeDedup(nowMs);
-  const dedupKey = makeExecuteDedupKey(market.slug, intervalKey, decision);
-  if (executeDedup.has(dedupKey)) {
+  if (execState.filledBuckets[String(bucketKey)] === true) {
     const resp = {
       ...base,
       deduped: true,
-      dedupKey,
-      reason: 'deduped',
+      reason: 'already_filled_this_bucket',
       tradeExecuted: false,
+      orderType: String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
+      attemptCount: 0,
+      ttlMs: ENV.POLY_ORDER_TYPE === 'GTC' ? ENV.POLY_GTC_TTL_MS : null,
     };
     state.lastRun = resp;
     await saveStateToDisk().catch(() => {});
+    await saveExecuteState(execState);
     logDecision(resp);
     return resp;
   }
-  executeDedup.set(dedupKey, { tsMs: nowMs });
+
+  if (Number.isFinite(Number(execState.pausedUntilBucket)) && bucketKey < Number(execState.pausedUntilBucket)) {
+    const resp = {
+      ...base,
+      deduped: false,
+      reason: 'max_step_reached_reset_pause',
+      tradeExecuted: false,
+      orderType: String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
+      attemptCount: 0,
+      ttlMs: ENV.POLY_ORDER_TYPE === 'GTC' ? ENV.POLY_GTC_TTL_MS : null,
+    };
+    state.lastRun = resp;
+    await saveStateToDisk().catch(() => {});
+    await saveExecuteState(execState);
+    logDecision(resp);
+    return resp;
+  }
 
   const barCloseTs = Math.floor(req.ts / 1000 / BAR_SEC) * BAR_SEC;
-  const skipForMin = sizing.belowOrderMinSize;
-  const guardrail = skipForMin
-    ? 'below_order_min_size'
+  const guardrail = hasPendingUnresolved
+    ? (reconcile.reconcileReason === 'reconcile_unavailable' ? 'reconcile_unavailable' : 'pending_limit_reached')
+    : sizing.belowMinSize
+    ? 'below_min_size'
     : guardrailReason({
       decision,
       barCloseTs,
@@ -995,7 +2109,6 @@ async function runExecute(body, requestRid) {
     const resp = {
       ...base,
       deduped: false,
-      dedupKey,
       reason: guardrail,
       tradeExecuted: false,
       state: {
@@ -1007,11 +2120,12 @@ async function runExecute(body, requestRid) {
     };
     state.lastRun = resp;
     await saveStateToDisk().catch(() => {});
+    await saveExecuteState(execState);
     logDecision(resp);
     return resp;
   }
 
-  const midPrice = await fetchMidpoint(tokenId).catch(() => null);
+  const midPrice = preMidPrice;
   const order = await placeOutcomeOrder({
     outcome,
     tokenId,
@@ -1020,32 +2134,109 @@ async function runExecute(body, requestRid) {
     mode: req.mode,
     dryRun: requestDryRun,
     midPrice,
+    runRid: requestRid,
+    decision,
+    bucketKey,
+    conditionId: market.conditionId,
+    fallbackTakerBaseFee: market.takerBaseFee,
   });
 
   let tradeExecuted = false;
   if (!order.skipped) {
     tradeExecuted = true;
+    execState.lastBucketKeyPlaced = bucketKey;
     state.lastTradeBarClose = barCloseTs;
     state.tradeHistory.push({ ts: nowTsSec, direction: decision });
     trimHistoryInPlace(state.tradeHistory, nowTsSec);
     state.positionUsd = Number((state.positionUsd + sizing.computedNotionalUSD).toFixed(6));
     state.lastDirection = decision;
-    if (ENV.POLY_AUTO_SIZE) state.autoSizeStep += 1;
+    if (!hasPendingUnresolved) {
+      execState.pendingTrade = {
+        bucketKey,
+        marketSlug: market.slug,
+        conditionId: String(market.conditionId || ''),
+        tokenId: String(tokenId || ''),
+        side: decision,
+        notionalUSD: sizing.computedNotionalUSD,
+        createdAtMs: nowMs,
+      };
+    }
   }
 
   const reason = order.skipped ? order.reason : 'trade_executed';
   const upstreamStatus = order.skipped ? (order.upstreamStatus ?? null) : null;
   const upstreamMessage = order.skipped ? (order.upstreamMessage ?? null) : null;
+  const feeRateBpsUsed = Number.isInteger(order?.feeRateBpsUsed) ? order.feeRateBpsUsed : null;
+  const feeSource = typeof order?.feeSource === 'string' ? order.feeSource : null;
+  const feeRaw = order?.feeRaw ?? null;
+  const orderType = typeof order?.orderType === 'string' ? order.orderType : String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase();
+  const attemptCount = Number.isFinite(order?.attemptCount) ? Number(order.attemptCount) : 0;
+  const ttlMs = Number.isFinite(order?.ttlMs) ? Number(order.ttlMs) : null;
+  const orderStatus = typeof order?.status === 'string' ? order.status : null;
+  const orderId = typeof order?.orderId === 'string' ? order.orderId : null;
+  const filled = order?.filled === true;
+  const orderRequest = order?.orderRequest && typeof order.orderRequest === 'object'
+    ? order.orderRequest
+    : null;
+  const precisionApplied = order?.precisionApplied && typeof order.precisionApplied === 'object'
+    ? order.precisionApplied
+    : null;
+  const clobPayloadPosted = order?.clobPayloadPosted && typeof order.clobPayloadPosted === 'object'
+    ? order.clobPayloadPosted
+    : null;
+  const makerAmountFinal = order?.makerAmountFinal
+    ?? clobPayloadPosted?.makerAmount
+    ?? orderRequest?.makerAmount
+    ?? null;
+  const takerAmountFinal = order?.takerAmountFinal
+    ?? clobPayloadPosted?.takerAmount
+    ?? orderRequest?.takerAmount
+    ?? null;
+  const priceFinal = order?.priceFinal
+    ?? clobPayloadPosted?.price
+    ?? (orderRequest?.price ?? null);
+  const sizeFinal = order?.sizeFinal
+    ?? clobPayloadPosted?.size
+    ?? (orderRequest?.size ?? null);
+  const geo = order.geo || null;
+  const responsePendingTrade = execState.pendingTrade
+    ? {
+      bucketKey: Number.isFinite(Number(execState.pendingTrade.bucketKey)) ? Number(execState.pendingTrade.bucketKey) : null,
+      marketSlug: String(execState.pendingTrade.marketSlug || ''),
+      conditionId: String(execState.pendingTrade.conditionId || ''),
+      tokenId: String(execState.pendingTrade.tokenId || ''),
+      side: String(execState.pendingTrade.side || ''),
+      notionalUSD: Math.max(0, safeNum(execState.pendingTrade.notionalUSD, 0)),
+      createdAtMs: Number.isFinite(Number(execState.pendingTrade.createdAtMs)) ? Number(execState.pendingTrade.createdAtMs) : null,
+    }
+    : null;
   const resp = {
     ...base,
     deduped: false,
-    dedupKey,
-    reason,
+    reason: reason === 'trade_executed' && hasPendingUnresolved ? 'pending_unresolved_base_stake' : reason,
+    feeRateBpsUsed,
+    feeSource,
+    feeRaw,
+    makerAmountFinal,
+    takerAmountFinal,
+    priceFinal,
+    sizeFinal,
+    orderType,
+    attemptCount,
+    ttlMs,
     voteSummary: quorum.voteSummary,
     ...(upstreamStatus ? { upstreamStatus } : {}),
     ...(upstreamMessage ? { upstreamMessage } : {}),
+    ...(orderStatus ? { orderStatus } : {}),
+    ...(orderId ? { orderId } : {}),
+    ...(order?.skipped ? { filled: false } : { filled }),
+    ...(order.skipped && (reason === 'clob_error' || reason === 'fee_rate_unavailable' || reason === 'open_wait_fill_force_fill' || reason === 'amount_precision_preflight_failed') && orderRequest ? { orderRequest } : {}),
+    ...(order.skipped && (reason === 'clob_error' || reason === 'fee_rate_unavailable' || reason === 'open_wait_fill_force_fill' || reason === 'amount_precision_preflight_failed') && precisionApplied ? { precisionApplied } : {}),
+    ...(order.skipped && (reason === 'clob_error' || reason === 'fee_rate_unavailable' || reason === 'open_wait_fill_force_fill' || reason === 'amount_precision_preflight_failed') && clobPayloadPosted ? { clobPayloadPosted } : {}),
+    ...(geo ? { geo: { blocked: Boolean(geo.blocked), country: geo.country || '', region: geo.region || '', ip: geo.ip || '' } } : {}),
     ...(!order.skipped ? { order } : {}),
     tradeExecuted,
+    pendingTrade: responsePendingTrade,
     state: {
       lastTradeBarClose: state.lastTradeBarClose,
       tradesLastHour: state.tradeHistory.length,
@@ -1053,8 +2244,13 @@ async function runExecute(body, requestRid) {
       lastDirection: state.lastDirection,
     },
   };
+  if (tradeExecuted) {
+    execState.lastBucketKeyPlaced = bucketKey;
+    execState.filledBuckets[String(bucketKey)] = true;
+  }
   state.lastRun = resp;
   await saveStateToDisk().catch(() => {});
+  await saveExecuteState(execState);
   logDecision(resp);
   return resp;
 }

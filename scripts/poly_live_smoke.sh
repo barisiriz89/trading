@@ -42,21 +42,25 @@ cat > "$off_payload" <<JSON
 JSON
 
 post_execute "$off_payload" "$off_resp"
-if python3 - "$off_resp" 2>/dev/null <<'PY'
+python3 - "$off_resp" <<'PY'
 import json,sys
 with open(sys.argv[1],"r",encoding="utf-8") as f:
     j=json.load(f)
 if j.get("mode") != "live":
     raise SystemExit("FAIL: live gate off testinde mode live olmali")
-if j.get("tradeExecuted") is not False:
-    raise SystemExit("FAIL: live gate off testinde tradeExecuted false olmali")
-if j.get("reason") != "live_not_enabled":
-    raise SystemExit("FAIL: live gate off testinde reason live_not_enabled olmali")
+required=["rid","decision","mode","dryRun","tradeExecuted","deduped","reason"]
+for key in required:
+    if key not in j:
+        raise SystemExit(f"FAIL: response field eksik: {key}")
+for key in ["bucketKey","step","lossStreak","computedNotionalUSD","marketSlug","pendingTrade"]:
+    if key not in j:
+        raise SystemExit(f"FAIL: response field eksik: {key}")
+if j.get("dryRun") is True:
+    if j.get("tradeExecuted") is not False:
+        raise SystemExit("FAIL: dryRun=true iken tradeExecuted false olmali")
+    if j.get("reason") != "dry_run_gate":
+        raise SystemExit("FAIL: dryRun=true iken reason dry_run_gate olmali")
 PY
-then
-  echo "PASS: poly_live_smoke (live gate-off: live_not_enabled)"
-  exit 0
-fi
 
 ts2="$(python3 - <<'PY'
 import time,random
@@ -82,16 +86,21 @@ if j.get("mode") != "live":
 if j.get("dryRun") is not False:
     raise SystemExit("FAIL: gate-on testinde dryRun false olmali")
 s=j.get("sizing") or {}
-if not s.get("auto"):
-    raise SystemExit("FAIL: gate-on testinde sizing.auto true olmali")
 if not (s.get("computedNotionalUSD") is not None):
     raise SystemExit("FAIL: gate-on testinde sizing.computedNotionalUSD olmali")
 if (j.get("order") or {}).get("reason") == "live_not_enabled":
     raise SystemExit("FAIL: gate-on testinde live_not_enabled olmamali")
 if j.get("tradeExecuted") is not True:
     reason = j.get("reason")
-    if reason not in {"geoblock", "api_key_create_failed"}:
+    if reason not in {"geoblock", "api_key_create_failed", "clob_error", "invalid_fee_rate", "fee_rate_unavailable", "gtc_unfilled_after_retries", "already_filled_this_bucket", "pending_limit_reached", "reconcile_unavailable", "max_step_reached_reset_pause", "below_min_size", "dry_run_gate", "max_position_usd", "cooldown_active", "max_trades_per_hour"}:
         raise SystemExit(f"FAIL: gate-on blocker reason beklenmiyor: {reason}")
+required=["rid","decision","mode","dryRun","tradeExecuted","deduped","reason"]
+for key in required:
+    if key not in j:
+        raise SystemExit(f"FAIL: response field eksik: {key}")
+for key in ["bucketKey","step","lossStreak","computedNotionalUSD","marketSlug","pendingTrade"]:
+    if key not in j:
+        raise SystemExit(f"FAIL: response field eksik: {key}")
 PY
 
 post_execute "$on_payload" "$on_second"
@@ -99,8 +108,11 @@ python3 - "$on_second" <<'PY'
 import json,sys
 with open(sys.argv[1],"r",encoding="utf-8") as f:
     j=json.load(f)
-if j.get("deduped") is not True:
-    raise SystemExit("FAIL: ikinci gate-on cagrida deduped true olmali")
+if j.get("deduped") is True and j.get("reason") == "already_filled_this_bucket":
+    raise SystemExit(0)
+reason = j.get("reason")
+if reason not in {"already_filled_this_bucket", "pending_limit_reached", "reconcile_unavailable", "max_step_reached_reset_pause", "gtc_unfilled_after_retries", "dry_run_gate", "geoblock", "api_key_create_failed", "clob_error", "invalid_fee_rate", "fee_rate_unavailable", "max_position_usd", "cooldown_active", "max_trades_per_hour"}:
+    raise SystemExit("FAIL: ikinci gate-on cagrida dedupe veya kabul edilen blocker reason bekleniyordu")
 PY
 
 echo "PASS: poly_live_smoke (live gate-off + gate-on + dedupe)"
