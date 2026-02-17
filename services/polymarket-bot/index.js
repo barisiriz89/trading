@@ -485,6 +485,15 @@ function buildOrderIntent(direction, yesTokenId, noTokenId) {
     : { side: 'BUY', tokenId: noTokenId, outcome: 'NO' };
 }
 
+function normalizeClobErrorReason(err) {
+  const raw = err instanceof Error ? err.message : String(err || '');
+  const msg = raw.toLowerCase();
+  if (msg.includes('trading restricted in your region') || msg.includes('geoblock')) return 'geoblocked_region';
+  if (msg.includes('could not create api key') || msg.includes('api credentials are needed')) return 'clob_auth_failed';
+  if (msg.includes('forbidden')) return 'clob_forbidden';
+  return `clob_error:${raw.slice(0, 120)}`;
+}
+
 async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrderId, midPrice }) {
   const intent = buildOrderIntent(direction, yesTokenId, noTokenId);
   const amountUsd = ENV.POLY_ORDER_USD;
@@ -576,44 +585,60 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
     };
   }
 
-  const mod = await import('@polymarket/clob-client');
-  const walletMod = await import('@ethersproject/wallet');
-  const ClobClient = mod?.ClobClient || mod?.default?.ClobClient || mod?.default;
-  const Wallet = walletMod?.Wallet || walletMod?.default;
-  if (!ClobClient) throw new Error('clob_client_constructor_not_found');
-  if (!Wallet) throw new Error('ethers_wallet_constructor_not_found');
+  try {
+    const mod = await import('@polymarket/clob-client');
+    const walletMod = await import('@ethersproject/wallet');
+    const ClobClient = mod?.ClobClient || mod?.default?.ClobClient || mod?.default;
+    const Wallet = walletMod?.Wallet || walletMod?.default;
+    if (!ClobClient) throw new Error('clob_client_constructor_not_found');
+    if (!Wallet) throw new Error('ethers_wallet_constructor_not_found');
 
-  const signer = new Wallet(ENV.POLY_PRIVATE_KEY);
-  const client = new ClobClient(ENV.POLY_CLOB_HOST, 137, signer, undefined, undefined, ENV.POLY_FUNDER_ADDRESS || undefined);
-  const maybeCreate = client.createOrDeriveApiKey || client.createApiKey || client.deriveApiKey;
-  if (typeof maybeCreate === 'function') {
-    const credsRaw = await maybeCreate.call(client);
-    if (credsRaw && typeof credsRaw === 'object') {
-      const normalized = {
-        key: credsRaw.key || credsRaw.apiKey || '',
-        secret: credsRaw.secret || '',
-        passphrase: credsRaw.passphrase || '',
-      };
-      if (normalized.key && normalized.secret && normalized.passphrase) client.creds = normalized;
+    const signer = new Wallet(ENV.POLY_PRIVATE_KEY);
+    const client = new ClobClient(ENV.POLY_CLOB_HOST, 137, signer, undefined, undefined, ENV.POLY_FUNDER_ADDRESS || undefined);
+    const maybeCreate = client.createOrDeriveApiKey || client.createApiKey || client.deriveApiKey;
+    if (typeof maybeCreate === 'function') {
+      const credsRaw = await maybeCreate.call(client);
+      if (credsRaw && typeof credsRaw === 'object') {
+        const normalized = {
+          key: credsRaw.key || credsRaw.apiKey || '',
+          secret: credsRaw.secret || '',
+          passphrase: credsRaw.passphrase || '',
+        };
+        if (normalized.key && normalized.secret && normalized.passphrase) client.creds = normalized;
+      }
     }
+
+    const orderPayload = {
+      tokenID: tokenId,
+      side: 'BUY',
+      orderType: 'MARKET',
+      amount: String(notionalUSD),
+      clientOrderId,
+    };
+    const postOrder = client.postOrder || client.createAndPostOrder || client.placeOrder;
+    if (typeof postOrder !== 'function') throw new Error('clob_post_order_method_not_found');
+
+    const result = await postOrder.call(client, orderPayload);
+    if (result?.error) {
+      return {
+        skipped: true,
+        reason: normalizeClobErrorReason(result.error),
+        intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+        result,
+      };
+    }
+    return {
+      skipped: false,
+      result,
+      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+    };
+  } catch (err) {
+    return {
+      skipped: true,
+      reason: normalizeClobErrorReason(err),
+      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+    };
   }
-
-  const orderPayload = {
-    tokenID: tokenId,
-    side: 'BUY',
-    orderType: 'MARKET',
-    amount: String(notionalUSD),
-    clientOrderId,
-  };
-  const postOrder = client.postOrder || client.createAndPostOrder || client.placeOrder;
-  if (typeof postOrder !== 'function') throw new Error('clob_post_order_method_not_found');
-
-  const result = await postOrder.call(client, orderPayload);
-  return {
-    skipped: false,
-    result,
-    intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
-  };
 }
 
 function tickLog(line) {
