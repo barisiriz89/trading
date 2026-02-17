@@ -497,12 +497,18 @@ async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrder
   }
 
   const mod = await import('@polymarket/clob-client');
+  const walletMod = await import('@ethersproject/wallet');
   const ClobClient = mod?.ClobClient || mod?.default?.ClobClient || mod?.default;
+  const Wallet = walletMod?.Wallet || walletMod?.default;
   if (!ClobClient) {
     throw new Error('clob_client_constructor_not_found');
   }
+  if (!Wallet) {
+    throw new Error('ethers_wallet_constructor_not_found');
+  }
 
-  const client = new ClobClient(ENV.POLY_CLOB_HOST, 137, ENV.POLY_PRIVATE_KEY, ENV.POLY_FUNDER_ADDRESS || undefined);
+  const signer = new Wallet(ENV.POLY_PRIVATE_KEY);
+  const client = new ClobClient(ENV.POLY_CLOB_HOST, 137, signer, undefined, undefined, ENV.POLY_FUNDER_ADDRESS || undefined);
   const maybeCreate = client.createApiKey || client.createOrDeriveApiKey;
   if (typeof maybeCreate === 'function') {
     await maybeCreate.call(client);
@@ -563,10 +569,14 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
   }
 
   const mod = await import('@polymarket/clob-client');
+  const walletMod = await import('@ethersproject/wallet');
   const ClobClient = mod?.ClobClient || mod?.default?.ClobClient || mod?.default;
+  const Wallet = walletMod?.Wallet || walletMod?.default;
   if (!ClobClient) throw new Error('clob_client_constructor_not_found');
+  if (!Wallet) throw new Error('ethers_wallet_constructor_not_found');
 
-  const client = new ClobClient(ENV.POLY_CLOB_HOST, 137, ENV.POLY_PRIVATE_KEY, ENV.POLY_FUNDER_ADDRESS || undefined);
+  const signer = new Wallet(ENV.POLY_PRIVATE_KEY);
+  const client = new ClobClient(ENV.POLY_CLOB_HOST, 137, signer, undefined, undefined, ENV.POLY_FUNDER_ADDRESS || undefined);
   const maybeCreate = client.createApiKey || client.createOrDeriveApiKey;
   if (typeof maybeCreate === 'function') await maybeCreate.call(client);
 

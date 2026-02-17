@@ -12,6 +12,7 @@
     "poly:test": "node --test"
   },
   "dependencies": {
+    "@ethersproject/wallet": "^5.8.0",
     "@polymarket/clob-client": "^2.0.0",
     "dotenv": "^17.3.1",
     "express": "^4.19.2",
