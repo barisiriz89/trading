@@ -44,7 +44,7 @@ post_execute() {
   fi
 }
 
-check_get_json "/healthz" >/dev/null
+check_get_json "/healthz/" >/dev/null
 check_get_json "/status" >/dev/null
 
 CID="smoke-$(date +%s)"
