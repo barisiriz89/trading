@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js",
-    "tick": "curl -sS -X POST http://localhost:${PORT:-19082}/tick"
+    "tick": "curl -sS -X POST http://localhost:${PORT:-19082}/tick",
+    "test": "node --test",
+    "poly:test": "node --test"
   },
   "dependencies": {
     "@polymarket/clob-client": "^2.0.0",
