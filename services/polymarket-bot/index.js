@@ -5,12 +5,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   chooseBtcUpDownMarketFromEvents,
-  computeExecuteNotional,
   computeQuorumDecision,
   extractUpDownTokens,
   intervalKeyFromTsMs,
   isLiveExecutionEnabled,
-  makeExecuteDedupKey,
   parseJsonArrayLike,
   validateExecutePayload,
 } from './lib/execute-core.js';
@@ -59,6 +57,15 @@ const ENV = {
   POLY_TARGET_PROFIT_USD: Number(process.env.POLY_TARGET_PROFIT_USD || 1),
   POLY_MIN_NOTIONAL_USD: Number(process.env.POLY_MIN_NOTIONAL_USD || 5),
   POLY_MAX_NOTIONAL_USD_HARD: Number(process.env.POLY_MAX_NOTIONAL_USD_HARD || 160),
+  POLY_EXIT_ENABLED: String(process.env.POLY_EXIT_ENABLED || 'true').toLowerCase() === 'true',
+  POLY_EXIT_MIN_NET_PROFIT_USD: Number(process.env.POLY_EXIT_MIN_NET_PROFIT_USD || 0.05),
+  POLY_EXIT_MAX_ATTEMPTS_PER_EXECUTE: Number(process.env.POLY_EXIT_MAX_ATTEMPTS_PER_EXECUTE || 1),
+  POLY_EXIT_SLIPPAGE_BPS: Number(process.env.POLY_EXIT_SLIPPAGE_BPS || 0),
+  POLY_EXIT_ONLY_AFTER_BUCKETS: Number(process.env.POLY_EXIT_ONLY_AFTER_BUCKETS || 1),
+  POLY_EXIT_MIN_ORDER_USD: Number(process.env.POLY_EXIT_MIN_ORDER_USD || 5),
+  POLY_EXIT_FORCE: String(process.env.POLY_EXIT_FORCE || 'false').toLowerCase() === 'true',
+  POLY_EXIT_FORCE_NET_PROFIT_USD: Number(process.env.POLY_EXIT_FORCE_NET_PROFIT_USD || 0.1),
+  POLY_MAX_OPEN_TRADES: Number(process.env.POLY_MAX_OPEN_TRADES || 6),
   POLY_STATE_COLLECTION: String(process.env.POLY_STATE_COLLECTION || 'polymarketBotState').trim(),
 };
 
@@ -92,16 +99,15 @@ const marketCache = {
   latestAuto: null,
 };
 
-const executeDedup = new Map();
 let firestoreClientPromise = null;
 
 const DEFAULT_EXECUTE_STATE = {
   step: 0,
   lossStreak: 0,
   cumulativeLossUSD: 0,
-  lastBucketKeyPlaced: null,
+  lastBucketKeyPlaced: null, // legacy compatibility
   filledBuckets: {},
-  pendingTrade: null,
+  openTrades: [],
   pausedUntilBucket: null,
   lastResolvedBucketKey: null,
 };
@@ -209,18 +215,39 @@ async function loadExecuteState(envName, market) {
     for (const [k, v] of Object.entries(filledRaw)) {
       if (v) filledBuckets[String(k)] = true;
     }
-    let pendingTrade = data.pendingTrade && typeof data.pendingTrade === 'object' ? data.pendingTrade : null;
-    if (!pendingTrade && Array.isArray(data.openBets) && data.openBets.length) {
-      const legacy = data.openBets[0];
-      pendingTrade = {
-        bucketKey: Number.isFinite(Number(legacy?.bucketKey)) ? Number(legacy.bucketKey) : null,
-        marketSlug: String(legacy?.marketSlug || ''),
-        conditionId: String(legacy?.conditionId || ''),
-        tokenId: String(legacy?.tokenId || ''),
-        side: String(legacy?.decision || '').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP',
-        notionalUSD: Math.max(0, safeNum(legacy?.notionalUSD, 0)),
-        createdAtMs: Number.isFinite(Number(legacy?.placedAtMs)) ? Number(legacy.placedAtMs) : Date.now(),
-      };
+    const openTradesRaw = Array.isArray(data.openTrades) ? data.openTrades : [];
+    const openTrades = openTradesRaw
+      .filter((x) => x && typeof x === 'object')
+      .map((x) => ({
+        bucketKey: Number.isFinite(Number(x.bucketKey)) ? Number(x.bucketKey) : null,
+        marketSlug: String(x.marketSlug || ''),
+        conditionId: String(x.conditionId || ''),
+        tokenId: String(x.tokenId || ''),
+        side: String(x.side || '').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP',
+        notionalUSD: Math.max(0, safeNum(x.notionalUSD, 0)),
+        priceEntry: Number.isFinite(Number(x.priceEntry)) ? Number(x.priceEntry) : null,
+        sizeEntry: Number.isFinite(Number(x.sizeEntry)) ? Number(x.sizeEntry) : null,
+        createdAtMs: Number.isFinite(Number(x.createdAtMs)) ? Number(x.createdAtMs) : Date.now(),
+        status: String(x.status || 'open'),
+        exit: x.exit && typeof x.exit === 'object' ? x.exit : null,
+        settlement: x.settlement && typeof x.settlement === 'object' ? x.settlement : null,
+      }));
+    if (!openTrades.length && data.pendingTrade && typeof data.pendingTrade === 'object') {
+      const p = data.pendingTrade;
+      openTrades.push({
+        bucketKey: Number.isFinite(Number(p.bucketKey)) ? Number(p.bucketKey) : null,
+        marketSlug: String(p.marketSlug || ''),
+        conditionId: String(p.conditionId || ''),
+        tokenId: String(p.tokenId || ''),
+        side: String(p.side || '').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP',
+        notionalUSD: Math.max(0, safeNum(p.notionalUSD, 0)),
+        priceEntry: null,
+        sizeEntry: null,
+        createdAtMs: Number.isFinite(Number(p.createdAtMs)) ? Number(p.createdAtMs) : Date.now(),
+        status: 'open',
+        exit: null,
+        settlement: null,
+      });
     }
     return {
       step: clamp(safeNum(data.step, 0), 0, 5),
@@ -228,7 +255,7 @@ async function loadExecuteState(envName, market) {
       cumulativeLossUSD: Math.max(0, safeNum(data.cumulativeLossUSD, 0)),
       lastBucketKeyPlaced: Number.isFinite(Number(data.lastBucketKeyPlaced)) ? Number(data.lastBucketKeyPlaced) : null,
       filledBuckets,
-      pendingTrade,
+      openTrades,
       pausedUntilBucket: Number.isFinite(Number(data.pausedUntilBucket)) ? Number(data.pausedUntilBucket) : null,
       lastResolvedBucketKey: Number.isFinite(Number(data.lastResolvedBucketKey)) ? Number(data.lastResolvedBucketKey) : null,
       _docId: docId,
@@ -249,7 +276,7 @@ async function saveExecuteState(execState) {
       cumulativeLossUSD: Math.max(0, safeNum(execState.cumulativeLossUSD, 0)),
       lastBucketKeyPlaced: Number.isFinite(Number(execState.lastBucketKeyPlaced)) ? Number(execState.lastBucketKeyPlaced) : null,
       filledBuckets: execState.filledBuckets && typeof execState.filledBuckets === 'object' ? execState.filledBuckets : {},
-      pendingTrade: execState.pendingTrade && typeof execState.pendingTrade === 'object' ? execState.pendingTrade : null,
+      openTrades: Array.isArray(execState.openTrades) ? execState.openTrades : [],
       pausedUntilBucket: Number.isFinite(Number(execState.pausedUntilBucket)) ? Number(execState.pausedUntilBucket) : null,
       lastResolvedBucketKey: Number.isFinite(Number(execState.lastResolvedBucketKey)) ? Number(execState.lastResolvedBucketKey) : null,
       updatedAtMs: Date.now(),
@@ -289,13 +316,6 @@ function resolveEnvTokenOverrides() {
     }
   }
   return null;
-}
-
-function purgeDedup(nowMs) {
-  const cutoff = nowMs - (6 * 3600 * 1000);
-  for (const [key, value] of executeDedup.entries()) {
-    if (value.tsMs < cutoff) executeDedup.delete(key);
-  }
 }
 
 function cachedMarketGet(slug, nowMs) {
@@ -646,18 +666,6 @@ function isLiveGateEnabled() {
   return isLiveExecutionEnabled(ENV.POLY_LIVE_ENABLED, ENV.POLY_LIVE_CONFIRM);
 }
 
-function computeExecuteSizing(requestNotionalUSD, marketOrderMinSize) {
-  return computeExecuteNotional({
-    autoSize: true,
-    startNotionalUSD: 1,
-    sizeMult: 2,
-    maxNotionalUSD: 32,
-    step: state.autoSizeStep,
-    requestNotionalUSD,
-    orderMinSize: marketOrderMinSize,
-  });
-}
-
 function deriveWinnerFromOutcomePrices(market) {
   const outcomes = parseJsonArrayLike(market?.outcomes).map((x) => String(x || '').toLowerCase());
   const prices = parseJsonArrayLike(market?.outcomePrices).map((x) => Number(x));
@@ -672,40 +680,6 @@ function deriveWinnerFromOutcomePrices(market) {
   if (!Number.isFinite(upP) || !Number.isFinite(downP)) return null;
   if (upP === downP) return null;
   return upP > downP ? 'UP' : 'DOWN';
-}
-
-async function reconcileSettledBets() {
-  if (!Array.isArray(state.pendingBets) || !state.pendingBets.length) return;
-  const pending = [...state.pendingBets];
-  const kept = [];
-  for (const bet of pending) {
-    const slug = String(bet?.marketSlug || '').trim();
-    if (!slug) continue;
-    try {
-      const payload = await fetchJson(`${ENV.POLY_GAMMA_HOST}/markets/slug/${encodeURIComponent(slug)}`);
-      const market = Array.isArray(payload) ? payload[0] : payload;
-      if (!market || !market.closed) {
-        kept.push(bet);
-        continue;
-      }
-      const winner = deriveWinnerFromOutcomePrices(market);
-      const decision = String(bet?.decision || '');
-      const notional = Number(bet?.notionalUSD || 0);
-      if (winner && decision) {
-        if (winner === decision) {
-          state.autoSizeStep = 0;
-        } else {
-          state.autoSizeStep = (state.autoSizeStep + 1) % 6;
-        }
-      }
-      if (Number.isFinite(notional) && notional > 0) {
-        state.positionUsd = Math.max(0, Number((state.positionUsd - notional).toFixed(6)));
-      }
-    } catch {
-      kept.push(bet);
-    }
-  }
-  state.pendingBets = kept;
 }
 
 function makeClientOrderId(slug, barCloseTs, direction) {
@@ -1270,6 +1244,7 @@ async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrder
 async function placeOutcomeOrder({
   outcome,
   tokenId,
+  side = 'BUY',
   notionalUSD,
   clientOrderId,
   mode,
@@ -1281,11 +1256,12 @@ async function placeOutcomeOrder({
   conditionId,
   fallbackTakerBaseFee,
 }) {
+  const orderSide = String(side || 'BUY').toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
   if (mode === 'test') {
     return {
       skipped: true,
       reason: 'mode_test',
-      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
 
@@ -1293,14 +1269,14 @@ async function placeOutcomeOrder({
     return {
       skipped: true,
       reason: 'dry_run_gate',
-      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
   if (ENV.POLY_KILL_SWITCH) {
     return {
       skipped: true,
       reason: 'kill_switch',
-      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
 
@@ -1308,7 +1284,7 @@ async function placeOutcomeOrder({
     return {
       skipped: true,
       reason: 'missing_private_key',
-      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
 
@@ -1319,7 +1295,7 @@ async function placeOutcomeOrder({
     return {
       skipped: true,
       reason: 'invalid_fee_rate',
-      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
 
@@ -1332,7 +1308,7 @@ async function placeOutcomeOrder({
       upstreamStatus: 403,
       upstreamMessage: detail ? `trading restricted in your region (${detail})` : 'trading restricted in your region',
       geo,
-      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
 
@@ -1362,20 +1338,20 @@ async function placeOutcomeOrder({
         feeRaw: null,
         orderRequest: sanitizeOrderRequest({
           tokenID: tokenId,
-          side: 'BUY',
+          side: orderSide,
           amount: amountUsdNum,
           price: normalizeOrderPrice(midPrice),
           feeRateBps: null,
           orderType: ENV.POLY_ORDER_TYPE,
         }),
-        intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+        intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
       };
     }
     feeLog({ rid: runRid, feeRateBps, tokenId });
 
     const baseOrderRequest = {
       tokenID: tokenId,
-      side: 'BUY',
+      side: orderSide,
       amount: amountUsdNum,
     };
     const price = normalizeOrderPrice(midPrice);
@@ -1431,7 +1407,7 @@ async function placeOutcomeOrder({
             precisionApplied: posted.precisionApplied || null,
             clobPayloadPosted: posted.clobPayloadPosted || null,
             ...(geo ? { geo } : {}),
-            intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+            intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
           };
         }
         const { result, orderType, finalOrderRequest, precisionApplied } = posted;
@@ -1454,7 +1430,7 @@ async function placeOutcomeOrder({
             precisionApplied,
             clobPayloadPosted: posted.clobPayloadPosted || null,
             ...(geo ? { geo } : {}),
-            intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+            intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
             result,
           };
         }
@@ -1486,7 +1462,7 @@ async function placeOutcomeOrder({
             clobPayloadPosted: posted.clobPayloadPosted || null,
             ...(geo ? { geo } : {}),
             result,
-            intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType },
+            intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType },
           };
         }
 
@@ -1516,7 +1492,7 @@ async function placeOutcomeOrder({
               clobPayloadPosted: posted.clobPayloadPosted || null,
               ...(geo ? { geo } : {}),
               result,
-              intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType },
+              intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType },
             };
           }
         }
@@ -1547,7 +1523,7 @@ async function placeOutcomeOrder({
           precisionApplied: { makerDecimals: 4, takerDecimals: 2, makerWas: null, takerWas: orderRequest?.amount ?? null },
           clobPayloadPosted: null,
           ...(geo ? { geo } : {}),
-          intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+          intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
         };
       }
 
@@ -1568,7 +1544,7 @@ async function placeOutcomeOrder({
         precisionApplied: { makerDecimals: 4, takerDecimals: 2, makerWas: null, takerWas: orderRequest?.amount ?? null },
         clobPayloadPosted: null,
         ...(geo ? { geo } : {}),
-        intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+        intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
       };
     }
 
@@ -1588,7 +1564,7 @@ async function placeOutcomeOrder({
         precisionApplied: posted.precisionApplied || null,
         clobPayloadPosted: posted.clobPayloadPosted || null,
         ...(geo ? { geo } : {}),
-        intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+        intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
       };
     }
     const { result, orderType, finalOrderRequest, precisionApplied } = posted;
@@ -1613,7 +1589,7 @@ async function placeOutcomeOrder({
             clobPayloadPosted: retried.clobPayloadPosted || null,
             ...(geo ? { geo } : {}),
             result: retried.result,
-            intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType: retried.orderType },
+            intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType: retried.orderType },
           };
         }
       }
@@ -1633,7 +1609,7 @@ async function placeOutcomeOrder({
         precisionApplied,
         clobPayloadPosted: posted.clobPayloadPosted || null,
         ...(geo ? { geo } : {}),
-        intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+        intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
         result,
       };
     }
@@ -1651,13 +1627,13 @@ async function placeOutcomeOrder({
       clobPayloadPosted: posted.clobPayloadPosted || null,
       ...(geo ? { geo } : {}),
       result,
-      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType },
+      intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType },
     };
   } catch (err) {
     const mapped = normalizeClobErrorReason(err);
     const precisionSeed = applyMakerTakerPrecision({
       tokenID: String(tokenId || ''),
-      side: 'BUY',
+      side: orderSide,
       amount: Number(notionalUSD ?? NaN),
       price: normalizeOrderPrice(midPrice),
       feeRateBps: Number.isInteger(feeOverride?.feeRateBps) ? feeOverride.feeRateBps : 0,
@@ -1679,7 +1655,7 @@ async function placeOutcomeOrder({
       attemptCount: 1,
       ttlMs: null,
       ...(geo ? { geo } : {}),
-      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+      intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
 }
@@ -1698,19 +1674,23 @@ function normalizeExecState(execState) {
   for (const [k, v] of Object.entries(filledRaw)) {
     if (v) filledBuckets[String(k)] = true;
   }
-  let pendingTrade = execState?.pendingTrade && typeof execState.pendingTrade === 'object' ? execState.pendingTrade : null;
-  if (!pendingTrade && Array.isArray(execState?.openBets) && execState.openBets.length) {
-    const legacy = execState.openBets[0];
-    pendingTrade = {
-      bucketKey: Number.isFinite(Number(legacy?.bucketKey)) ? Number(legacy.bucketKey) : null,
-      marketSlug: String(legacy?.marketSlug || ''),
-      conditionId: String(legacy?.conditionId || ''),
-      tokenId: String(legacy?.tokenId || ''),
-      side: String(legacy?.decision || '').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP',
-      notionalUSD: Math.max(0, safeNum(legacy?.notionalUSD, 0)),
-      createdAtMs: Number.isFinite(Number(legacy?.placedAtMs)) ? Number(legacy.placedAtMs) : Date.now(),
-    };
-  }
+  const openTrades = Array.isArray(execState?.openTrades) ? execState.openTrades : [];
+  const normalizedOpenTrades = openTrades
+    .filter((x) => x && typeof x === 'object')
+    .map((x) => ({
+      bucketKey: Number.isFinite(Number(x.bucketKey)) ? Number(x.bucketKey) : null,
+      marketSlug: String(x.marketSlug || ''),
+      conditionId: String(x.conditionId || ''),
+      tokenId: String(x.tokenId || ''),
+      side: String(x.side || '').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP',
+      notionalUSD: Math.max(0, safeNum(x.notionalUSD, 0)),
+      priceEntry: Number.isFinite(Number(x.priceEntry)) ? Number(x.priceEntry) : null,
+      sizeEntry: Number.isFinite(Number(x.sizeEntry)) ? Number(x.sizeEntry) : null,
+      createdAtMs: Number.isFinite(Number(x.createdAtMs)) ? Number(x.createdAtMs) : Date.now(),
+      status: String(x.status || 'open'),
+      exit: x.exit && typeof x.exit === 'object' ? x.exit : null,
+      settlement: x.settlement && typeof x.settlement === 'object' ? x.settlement : null,
+    }));
   return {
     ...DEFAULT_EXECUTE_STATE,
     ...execState,
@@ -1721,37 +1701,51 @@ function normalizeExecState(execState) {
     lastResolvedBucketKey: Number.isFinite(Number(execState?.lastResolvedBucketKey)) ? Number(execState.lastResolvedBucketKey) : null,
     pausedUntilBucket: Number.isFinite(Number(execState?.pausedUntilBucket)) ? Number(execState.pausedUntilBucket) : null,
     filledBuckets,
-    pendingTrade,
+    openTrades: normalizedOpenTrades,
   };
 }
 
 async function reconcileExecuteState(execState, currentBucketKey) {
   const next = normalizeExecState(execState);
-  const pending = next.pendingTrade;
-  if (!pending) return { state: next, reconcileReason: null, pendingResolved: false };
+  const openTrades = Array.isArray(next.openTrades) ? next.openTrades : [];
+  const unresolved = openTrades
+    .filter((t) => t.status === 'open' && Number.isFinite(Number(t.bucketKey)) && Number(t.bucketKey) < currentBucketKey)
+    .sort((a, b) => Number(a.bucketKey) - Number(b.bucketKey));
 
-  const pendingBucket = Number(pending?.bucketKey);
-  const pendingSlug = String(pending?.marketSlug || '').trim();
-  if (!Number.isFinite(pendingBucket) || !pendingSlug || pendingBucket >= currentBucketKey) {
-    return { state: next, reconcileReason: null, pendingResolved: false };
-  }
-
-  try {
-    const payload = await fetchJson(`${ENV.POLY_GAMMA_HOST}/markets/slug/${encodeURIComponent(pendingSlug)}`);
-    const market = Array.isArray(payload) ? payload[0] : payload;
-    if (!market || !market.closed) {
-      return { state: next, reconcileReason: null, pendingResolved: false };
+  let reconcileReason = null;
+  let changed = false;
+  for (const trade of unresolved) {
+    try {
+      const payload = await fetchJson(`${ENV.POLY_GAMMA_HOST}/markets/slug/${encodeURIComponent(trade.marketSlug)}`);
+      const market = Array.isArray(payload) ? payload[0] : payload;
+      if (!market || !market.closed) continue;
+      const winner = deriveWinnerFromOutcomePrices(market);
+      if (!winner || (winner !== 'UP' && winner !== 'DOWN')) {
+        reconcileReason = reconcileReason || 'reconcile_unavailable';
+        continue;
+      }
+      const settled = applySettlementOutcome(next, trade, winner, currentBucketKey, LADDER.length - 1);
+      next.step = settled.state.step;
+      next.lossStreak = settled.state.lossStreak;
+      next.cumulativeLossUSD = settled.state.cumulativeLossUSD;
+      next.pausedUntilBucket = settled.state.pausedUntilBucket ?? next.pausedUntilBucket;
+      next.lastResolvedBucketKey = Number.isFinite(Number(trade.bucketKey)) ? Number(trade.bucketKey) : next.lastResolvedBucketKey;
+      trade.status = 'settled';
+      trade.settlement = {
+        resolvedAtMs: Date.now(),
+        winningSide: winner,
+        winBool: winner === trade.side,
+      };
+      changed = true;
+      reconcileReason = settled.reason;
+    } catch {
+      reconcileReason = reconcileReason || 'reconcile_unavailable';
     }
-    const winner = deriveWinnerFromOutcomePrices(market);
-    if (!winner || (winner !== 'UP' && winner !== 'DOWN')) {
-      return { state: next, reconcileReason: 'reconcile_unavailable', pendingResolved: false };
-    }
-
-    const settled = applySettlementOutcome(next, pending, winner, currentBucketKey, LADDER.length - 1);
-    return { state: settled.state, reconcileReason: settled.reason, pendingResolved: true };
-  } catch {
-    return { state: next, reconcileReason: 'reconcile_unavailable', pendingResolved: false };
   }
+  if (changed) {
+    next.openTrades = openTrades;
+  }
+  return { state: next, reconcileReason, pendingResolved: changed };
 }
 
 function computeRecoverySizing({ execState, marketOrderMinSize, forceBaseStake = false }) {
@@ -1776,6 +1770,76 @@ function computeRecoverySizing({ execState, marketOrderMinSize, forceBaseStake =
     belowMinSize: computedNotionalUSD < minNotional,
     recoveryUnreachable: false,
     reason: null,
+  };
+}
+
+function summarizeOpenTrades(execState) {
+  const openTrades = Array.isArray(execState?.openTrades) ? execState.openTrades : [];
+  return openTrades.map((t) => ({
+    tradeId: `${String(t.bucketKey ?? '')}:${String(t.tokenId || '')}:${String(t.side || '')}`,
+    bucketKey: Number.isFinite(Number(t.bucketKey)) ? Number(t.bucketKey) : null,
+    side: String(t.side || ''),
+    tokenId: String(t.tokenId || ''),
+    status: String(t.status || 'open'),
+    notionalUSD: Math.max(0, safeNum(t.notionalUSD, 0)),
+    createdAtMs: Number.isFinite(Number(t.createdAtMs)) ? Number(t.createdAtMs) : null,
+  }));
+}
+
+function countOpenTrades(execState) {
+  const openTrades = Array.isArray(execState?.openTrades) ? execState.openTrades : [];
+  const summary = { open: 0, closed_exit: 0, settled: 0, total: openTrades.length };
+  for (const t of openTrades) {
+    if (t.status === 'open') summary.open += 1;
+    else if (t.status === 'closed_exit') summary.closed_exit += 1;
+    else if (t.status === 'settled') summary.settled += 1;
+  }
+  return summary;
+}
+
+function oppositeSide(side) {
+  return String(side || '').toUpperCase() === 'UP' ? 'DOWN' : 'UP';
+}
+
+async function fetchBestBid(tokenId) {
+  try {
+    const url = `${ENV.POLY_CLOB_HOST}/book?token_id=${encodeURIComponent(String(tokenId || ''))}`;
+    const payload = await fetchJson(url);
+    const bids = Array.isArray(payload?.bids) ? payload.bids : [];
+    if (!bids.length) return null;
+    const best = bids[0];
+    const p = Number(best?.price ?? best?.p ?? best?.rate);
+    return Number.isFinite(p) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchBestAsk(tokenId) {
+  try {
+    const url = `${ENV.POLY_CLOB_HOST}/book?token_id=${encodeURIComponent(String(tokenId || ''))}`;
+    const payload = await fetchJson(url);
+    const asks = Array.isArray(payload?.asks) ? payload.asks : [];
+    if (!asks.length) return null;
+    const best = asks[0];
+    const p = Number(best?.price ?? best?.p ?? best?.rate);
+    return Number.isFinite(p) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+function exitPolicySnapshot(marketOrderMinSize) {
+  return {
+    minNetProfitUSD: Number(ENV.POLY_EXIT_MIN_NET_PROFIT_USD),
+    maxExitAttemptsPerExecute: Math.max(1, Number(ENV.POLY_EXIT_MAX_ATTEMPTS_PER_EXECUTE) || 1),
+    useBidForYesSell: true,
+    useAskForNoSell: false,
+    slippageBps: Number(ENV.POLY_EXIT_SLIPPAGE_BPS || 0),
+    minOrderSizeUSD: Math.max(
+      Number(ENV.POLY_EXIT_MIN_ORDER_USD || 5),
+      Number.isFinite(Number(marketOrderMinSize)) ? Number(marketOrderMinSize) : 0,
+    ),
   };
 }
 
@@ -1939,7 +2003,6 @@ async function runTick(reqRid) {
 
 async function runExecute(body, requestRid) {
   const nowMs = Date.now();
-  const nowTsSec = Math.floor(nowMs / 1000);
   const parsed = validateExecutePayload(body, ENV.POLY_TV_SECRET);
   if (!parsed.ok) {
     return { ok: false, status: parsed.status, error: parsed.error, rid: requestRid, ts: new Date().toISOString() };
@@ -1951,34 +2014,27 @@ async function runExecute(body, requestRid) {
   const quorum = computeQuorumDecision(req.votes, req.minAgree);
   const decision = quorum.decision;
   const outcome = decision === 'UP' ? 'Up' : decision === 'DOWN' ? 'Down' : null;
-  const intervalKey = intervalKeyFromTsMs(req.ts);
-  const bucketKey = intervalKey;
+  const bucketKey = intervalKeyFromTsMs(req.ts);
 
   const market = await resolveUpDownMarket(req.marketSlug, nowMs);
   const tokenId = decision === 'UP' ? market.yesTokenId : decision === 'DOWN' ? market.noTokenId : null;
   let execState = normalizeExecState(await loadExecuteState(req.env, market));
   const reconcile = await reconcileExecuteState(execState, bucketKey);
   execState = normalizeExecState(reconcile.state);
-  const hasPendingUnresolved = Boolean(execState.pendingTrade);
-  const preMidPrice = tokenId ? await fetchMidpoint(tokenId).catch(() => null) : null;
+  const unresolvedTradesBefore = (Array.isArray(execState.openTrades) ? execState.openTrades : []).filter((t) => t.status === 'open');
+  const pendingUnresolvedCountBefore = unresolvedTradesBefore.length;
+  const hasPendingUnresolved = pendingUnresolvedCountBefore > 0;
+  const midPrice = tokenId ? await fetchMidpoint(tokenId).catch(() => null) : null;
   const sizing = computeRecoverySizing({
     execState,
     marketOrderMinSize: market.orderMinSize,
     forceBaseStake: hasPendingUnresolved,
   });
-  const pendingSummary = execState.pendingTrade
-    ? {
-      bucketKey: Number.isFinite(Number(execState.pendingTrade.bucketKey)) ? Number(execState.pendingTrade.bucketKey) : null,
-      marketSlug: String(execState.pendingTrade.marketSlug || ''),
-      conditionId: String(execState.pendingTrade.conditionId || ''),
-      tokenId: String(execState.pendingTrade.tokenId || ''),
-      side: String(execState.pendingTrade.side || ''),
-      notionalUSD: Math.max(0, safeNum(execState.pendingTrade.notionalUSD, 0)),
-      createdAtMs: Number.isFinite(Number(execState.pendingTrade.createdAtMs)) ? Number(execState.pendingTrade.createdAtMs) : null,
-    }
-    : null;
-
-  const base = {
+  const exitPolicy = exitPolicySnapshot(market.orderMinSize);
+  let exitAttempted = false;
+  let exitEligibleCount = 0;
+  let exitResult = null;
+  const mkBase = () => ({
     ok: true,
     rid: requestRid,
     ts: new Date().toISOString(),
@@ -1987,20 +2043,23 @@ async function runExecute(body, requestRid) {
     outcome,
     tokenId,
     voteCounts: quorum.counts,
-      voteSummary: quorum.voteSummary,
-      intervalKey,
-      bucketKey,
-      mode: req.mode,
-      dryRun: requestDryRun,
-      killSwitch: ENV.POLY_KILL_SWITCH,
+    voteSummary: quorum.voteSummary,
+    bucketKey,
+    mode: req.mode,
+    dryRun: requestDryRun,
+    killSwitch: ENV.POLY_KILL_SWITCH,
     signerAddress: proofIdentity.signerAddress,
     funderAddress: proofIdentity.funderAddress,
     signatureType: proofIdentity.signatureType,
     computedNotionalUSD: sizing.computedNotionalUSD,
-    step: sizing.step,
+    step: Math.max(0, Number(execState.step ?? sizing.step)),
     lossStreak: Math.max(0, safeNum(execState.lossStreak, 0)),
-    cumulativeLossUSD: Math.max(0, safeNum(execState.cumulativeLossUSD, 0)),
-    pendingTrade: pendingSummary,
+    pendingUnresolvedCount: (Array.isArray(execState.openTrades) ? execState.openTrades : []).filter((t) => t.status === 'open').length,
+    openTradesSummary: summarizeOpenTrades(execState),
+    exitAttempted,
+    exitEligibleCount,
+    exitResult,
+    exitPolicy,
     sizing: {
       auto: false,
       step: sizing.step,
@@ -2010,9 +2069,8 @@ async function runExecute(body, requestRid) {
       adjustedToMin: sizing.adjustedToMin,
       orderMinSize: market.orderMinSize,
       ladderNotional: sizing.ladderNotional,
-      dynamicNotional: Number.isFinite(sizing.dynamicNotional) ? Number(sizing.dynamicNotional.toFixed(6)) : null,
     },
-  };
+  });
 
   const logDecision = (resp) => {
     decisionLog({
@@ -2025,30 +2083,22 @@ async function runExecute(body, requestRid) {
       tradeExecuted: Boolean(resp?.tradeExecuted),
       deduped: Boolean(resp?.deduped),
       reason: resp?.reason,
+      step: resp?.step,
+      lossStreak: resp?.lossStreak,
+      computedNotionalUSD: resp?.computedNotionalUSD,
+      openTradesCount: Array.isArray(resp?.openTradesSummary) ? resp.openTradesSummary.filter((x) => x.status === 'open').length : null,
+      exitAttempted: Boolean(resp?.exitAttempted),
       orderType: resp?.orderType ?? null,
       attemptCount: Number.isFinite(resp?.attemptCount) ? resp.attemptCount : null,
       upstreamStatus: resp?.upstreamStatus ?? null,
-      feeSource: resp?.feeSource ?? null,
-      feeRateBpsUsed: Number.isInteger(resp?.feeRateBpsUsed) ? resp.feeRateBpsUsed : null,
-      makerAmountFinal: resp?.makerAmountFinal ?? null,
-      takerAmountFinal: resp?.takerAmountFinal ?? null,
-      priceFinal: resp?.priceFinal ?? null,
-      sizeFinal: resp?.sizeFinal ?? null,
-      precisionApplied: Boolean(resp?.precisionApplied),
-      computedNotionalUSD: sizing.computedNotionalUSD,
-      step: base.step,
-      lossStreak: base.lossStreak,
-      cumulativeLossUSD: base.cumulativeLossUSD,
-      geoBlocked: resp?.geo?.blocked ?? null,
     });
   };
 
-  if (decision === 'NO_TRADE') {
+  if (reconcile.reconcileReason === 'max_step_reached_reset_pause') {
     const resp = {
-      ...base,
+      ...mkBase(),
       deduped: false,
-      reason: reconcile.reconcileReason === 'max_step_reached_reset_pause' ? 'max_step_reached_reset_pause' : 'no_quorum',
-      tokenId: null,
+      reason: 'max_step_reached_reset_pause',
       tradeExecuted: false,
     };
     state.lastRun = resp;
@@ -2060,13 +2110,10 @@ async function runExecute(body, requestRid) {
 
   if (execState.filledBuckets[String(bucketKey)] === true) {
     const resp = {
-      ...base,
+      ...mkBase(),
       deduped: true,
       reason: 'already_filled_this_bucket',
       tradeExecuted: false,
-      orderType: String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
-      attemptCount: 0,
-      ttlMs: ENV.POLY_ORDER_TYPE === 'GTC' ? ENV.POLY_GTC_TTL_MS : null,
     };
     state.lastRun = resp;
     await saveStateToDisk().catch(() => {});
@@ -2077,13 +2124,10 @@ async function runExecute(body, requestRid) {
 
   if (Number.isFinite(Number(execState.pausedUntilBucket)) && bucketKey < Number(execState.pausedUntilBucket)) {
     const resp = {
-      ...base,
+      ...mkBase(),
       deduped: false,
-      reason: 'max_step_reached_reset_pause',
+      reason: 'paused',
       tradeExecuted: false,
-      orderType: String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
-      attemptCount: 0,
-      ttlMs: ENV.POLY_ORDER_TYPE === 'GTC' ? ENV.POLY_GTC_TTL_MS : null,
     };
     state.lastRun = resp;
     await saveStateToDisk().catch(() => {});
@@ -2092,31 +2136,13 @@ async function runExecute(body, requestRid) {
     return resp;
   }
 
-  const barCloseTs = Math.floor(req.ts / 1000 / BAR_SEC) * BAR_SEC;
-  const guardrail = hasPendingUnresolved
-    ? (reconcile.reconcileReason === 'reconcile_unavailable' ? 'reconcile_unavailable' : 'pending_limit_reached')
-    : sizing.belowMinSize
-    ? 'below_min_size'
-    : guardrailReason({
-      decision,
-      barCloseTs,
-      nowTs: nowTsSec,
-      notionalUSD: sizing.computedNotionalUSD,
-      mode: req.mode,
-    });
-
-  if (guardrail) {
+  const openTradeCap = Math.max(1, Number(ENV.POLY_MAX_OPEN_TRADES) || 6);
+  if (pendingUnresolvedCountBefore >= openTradeCap) {
     const resp = {
-      ...base,
+      ...mkBase(),
       deduped: false,
-      reason: guardrail,
+      reason: 'open_trades_cap_reached',
       tradeExecuted: false,
-      state: {
-        lastTradeBarClose: state.lastTradeBarClose,
-        tradesLastHour: state.tradeHistory.length,
-        positionUsd: state.positionUsd,
-        lastDirection: state.lastDirection,
-      },
     };
     state.lastRun = resp;
     await saveStateToDisk().catch(() => {});
@@ -2125,10 +2151,32 @@ async function runExecute(body, requestRid) {
     return resp;
   }
 
-  const midPrice = preMidPrice;
+  if (decision === 'NO_TRADE') {
+    const resp = {
+      ...mkBase(),
+      deduped: false,
+      reason: 'no_quorum',
+      tradeExecuted: false,
+    };
+    state.lastRun = resp;
+    await saveStateToDisk().catch(() => {});
+    await saveExecuteState(execState);
+    logDecision(resp);
+    return resp;
+  }
+  if (sizing.belowMinSize) {
+    const resp = { ...mkBase(), deduped: false, reason: 'below_min_size', tradeExecuted: false };
+    state.lastRun = resp;
+    await saveStateToDisk().catch(() => {});
+    await saveExecuteState(execState);
+    logDecision(resp);
+    return resp;
+  }
+
   const order = await placeOutcomeOrder({
     outcome,
     tokenId,
+    side: 'BUY',
     notionalUSD: sizing.computedNotionalUSD,
     clientOrderId: req.clientOrderId,
     mode: req.mode,
@@ -2142,28 +2190,158 @@ async function runExecute(body, requestRid) {
   });
 
   let tradeExecuted = false;
+  let reason = order.skipped ? order.reason : 'trade_executed';
   if (!order.skipped) {
     tradeExecuted = true;
-    execState.lastBucketKeyPlaced = bucketKey;
-    state.lastTradeBarClose = barCloseTs;
-    state.tradeHistory.push({ ts: nowTsSec, direction: decision });
-    trimHistoryInPlace(state.tradeHistory, nowTsSec);
+    execState.openTrades = [...(Array.isArray(execState.openTrades) ? execState.openTrades : []), {
+      bucketKey,
+      marketSlug: market.slug,
+      conditionId: String(market.conditionId || ''),
+      tokenId: String(tokenId || ''),
+      side: decision,
+      notionalUSD: sizing.computedNotionalUSD,
+      priceEntry: Number.isFinite(Number(order?.priceFinal ?? order?.clobPayloadPosted?.price)) ? Number(order.priceFinal ?? order.clobPayloadPosted.price) : null,
+      sizeEntry: Number.isFinite(Number(order?.sizeFinal ?? order?.clobPayloadPosted?.size)) ? Number(order.sizeFinal ?? order.clobPayloadPosted.size) : null,
+      createdAtMs: nowMs,
+      status: 'open',
+      exit: { attemptedBuckets: [] },
+      settlement: null,
+    }];
+  }
+
+  execState.lastBucketKeyPlaced = bucketKey;
+  execState.filledBuckets[String(bucketKey)] = true;
+
+  if (tradeExecuted) {
+    state.lastTradeBarClose = Math.floor(req.ts / 1000 / BAR_SEC) * BAR_SEC;
+    state.tradeHistory.push({ ts: Math.floor(nowMs / 1000), direction: decision });
+    trimHistoryInPlace(state.tradeHistory, Math.floor(nowMs / 1000));
     state.positionUsd = Number((state.positionUsd + sizing.computedNotionalUSD).toFixed(6));
     state.lastDirection = decision;
-    if (!hasPendingUnresolved) {
-      execState.pendingTrade = {
+  }
+
+  if (ENV.POLY_EXIT_ENABLED) {
+    const openTrades = (Array.isArray(execState.openTrades) ? execState.openTrades : []).filter((t) => t.status === 'open');
+    let exitAttempts = 0;
+    for (const trade of openTrades) {
+      if (exitAttempts >= Math.max(1, Number(ENV.POLY_EXIT_MAX_ATTEMPTS_PER_EXECUTE) || 1)) break;
+      const tBucket = Number(trade.bucketKey);
+      if (!Number.isFinite(tBucket)) continue;
+      if (bucketKey < (tBucket + Math.max(0, Number(ENV.POLY_EXIT_ONLY_AFTER_BUCKETS) || 1))) continue;
+
+      const attemptedBuckets = Array.isArray(trade?.exit?.attemptedBuckets) ? trade.exit.attemptedBuckets.map((x) => Number(x)) : [];
+      if (attemptedBuckets.includes(bucketKey)) continue;
+
+      const bestBid = await fetchBestBid(trade.tokenId);
+      const bestAsk = await fetchBestAsk(trade.tokenId);
+      const entryPrice = Number.isFinite(Number(trade.priceEntry)) ? Number(trade.priceEntry) : null;
+      const markPriceUsedRaw = Number.isFinite(Number(bestBid)) ? Number(bestBid) : null;
+      const markPriceUsed = Number.isFinite(markPriceUsedRaw)
+        ? Number((markPriceUsedRaw * (1 - (Number(ENV.POLY_EXIT_SLIPPAGE_BPS || 0) / 10000))).toFixed(6))
+        : null;
+      const size = Number.isFinite(Number(trade.sizeEntry))
+        ? Number(trade.sizeEntry)
+        : (entryPrice && entryPrice > 0 ? Number(trade.notionalUSD) / entryPrice : null);
+      if (!Number.isFinite(size) || !Number.isFinite(markPriceUsed) || markPriceUsed <= 0) {
+        exitResult = {
+          tradeId: `${trade.bucketKey}:${trade.tokenId}:${trade.side}`,
+          attempted: false,
+          executed: false,
+          reason: 'exit_no_liquidity',
+          bestBid,
+          bestAsk,
+          entryPrice,
+          markPriceUsed,
+          estGrossPnL: null,
+          estNetPnL: null,
+          feeRateBpsUsed: null,
+          orderType: String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
+          attemptCount: 0,
+          upstreamStatus: null,
+          upstreamMessage: null,
+        };
+        continue;
+      }
+      const feeBps = Number.isFinite(Number(market.takerBaseFee)) ? Number(market.takerBaseFee) : 0;
+      const estGross = (markPriceUsed - (entryPrice || markPriceUsed)) * size;
+      const estFees = ((trade.notionalUSD || 0) * feeBps / 10000) + ((size * markPriceUsed) * feeBps / 10000);
+      let estNet = estGross - estFees;
+      if (ENV.POLY_EXIT_FORCE) estNet = Number(ENV.POLY_EXIT_FORCE_NET_PROFIT_USD || 0.1);
+      if (estNet < Number(ENV.POLY_EXIT_MIN_NET_PROFIT_USD || 0.05)) {
+        exitResult = {
+          tradeId: `${trade.bucketKey}:${trade.tokenId}:${trade.side}`,
+          attempted: false,
+          executed: false,
+          reason: 'exit_not_profitable',
+          bestBid,
+          bestAsk,
+          entryPrice,
+          markPriceUsed,
+          estGrossPnL: Number(estGross.toFixed(6)),
+          estNetPnL: Number(estNet.toFixed(6)),
+          feeRateBpsUsed: feeBps,
+          orderType: String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
+          attemptCount: 0,
+          upstreamStatus: null,
+          upstreamMessage: null,
+        };
+        continue;
+      }
+
+      exitEligibleCount += 1;
+      exitAttempted = true;
+      exitAttempts += 1;
+      const exitNotional = Math.max(Number(ENV.POLY_EXIT_MIN_ORDER_USD || 5), Math.min(Number(trade.notionalUSD || 0), Number(trade.notionalUSD || 0)));
+      const exitOrder = await placeOutcomeOrder({
+        outcome: String(trade.side || '').toUpperCase() === 'UP' ? 'Up' : 'Down',
+        tokenId: trade.tokenId,
+        side: 'SELL',
+        notionalUSD: exitNotional,
+        clientOrderId: `${req.clientOrderId}:exit:${trade.bucketKey}`,
+        mode: req.mode,
+        dryRun: requestDryRun,
+        midPrice: markPriceUsed,
+        runRid: requestRid,
+        decision: String(trade.side || '').toUpperCase(),
         bucketKey,
-        marketSlug: market.slug,
-        conditionId: String(market.conditionId || ''),
-        tokenId: String(tokenId || ''),
-        side: decision,
-        notionalUSD: sizing.computedNotionalUSD,
-        createdAtMs: nowMs,
+        conditionId: trade.conditionId || market.conditionId,
+        fallbackTakerBaseFee: market.takerBaseFee,
+      });
+      trade.exit = {
+        attemptedBuckets: [...attemptedBuckets, bucketKey],
+        closedAtMs: exitOrder.skipped ? null : nowMs,
+        reason: exitOrder.skipped ? String(exitOrder.reason || 'exit_unfilled') : 'exit_executed_profit',
+        price: exitOrder?.priceFinal ?? markPriceUsed,
+        size: exitOrder?.sizeFinal ?? size,
       };
+      if (!exitOrder.skipped) {
+        trade.status = 'closed_exit';
+        execState.step = 0;
+        execState.lossStreak = 0;
+        execState.cumulativeLossUSD = 0;
+      }
+      exitResult = {
+        tradeId: `${trade.bucketKey}:${trade.tokenId}:${trade.side}`,
+        attempted: true,
+        executed: !exitOrder.skipped,
+        reason: exitOrder.skipped ? 'exit_unfilled' : 'exit_executed_profit',
+        bestBid,
+        bestAsk,
+        entryPrice,
+        markPriceUsed,
+        estGrossPnL: Number(estGross.toFixed(6)),
+        estNetPnL: Number(estNet.toFixed(6)),
+        feeRateBpsUsed: Number.isInteger(exitOrder?.feeRateBpsUsed) ? exitOrder.feeRateBpsUsed : feeBps,
+        orderType: String(exitOrder?.orderType || ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
+        attemptCount: Number(exitOrder?.attemptCount || 1),
+        upstreamStatus: exitOrder?.upstreamStatus ?? null,
+        upstreamMessage: exitOrder?.upstreamMessage ?? null,
+      };
+      if (!exitOrder.skipped && reason === 'trade_executed') reason = 'exit_executed_profit';
+      break;
     }
   }
 
-  const reason = order.skipped ? order.reason : 'trade_executed';
   const upstreamStatus = order.skipped ? (order.upstreamStatus ?? null) : null;
   const upstreamMessage = order.skipped ? (order.upstreamMessage ?? null) : null;
   const feeRateBpsUsed = Number.isInteger(order?.feeRateBpsUsed) ? order.feeRateBpsUsed : null;
@@ -2199,21 +2377,10 @@ async function runExecute(body, requestRid) {
     ?? clobPayloadPosted?.size
     ?? (orderRequest?.size ?? null);
   const geo = order.geo || null;
-  const responsePendingTrade = execState.pendingTrade
-    ? {
-      bucketKey: Number.isFinite(Number(execState.pendingTrade.bucketKey)) ? Number(execState.pendingTrade.bucketKey) : null,
-      marketSlug: String(execState.pendingTrade.marketSlug || ''),
-      conditionId: String(execState.pendingTrade.conditionId || ''),
-      tokenId: String(execState.pendingTrade.tokenId || ''),
-      side: String(execState.pendingTrade.side || ''),
-      notionalUSD: Math.max(0, safeNum(execState.pendingTrade.notionalUSD, 0)),
-      createdAtMs: Number.isFinite(Number(execState.pendingTrade.createdAtMs)) ? Number(execState.pendingTrade.createdAtMs) : null,
-    }
-    : null;
   const resp = {
-    ...base,
+    ...mkBase(),
     deduped: false,
-    reason: reason === 'trade_executed' && hasPendingUnresolved ? 'pending_unresolved_base_stake' : reason,
+    reason: tradeExecuted && hasPendingUnresolved ? 'pending_unresolved_base_stake' : reason,
     feeRateBpsUsed,
     feeSource,
     feeRaw,
@@ -2236,18 +2403,12 @@ async function runExecute(body, requestRid) {
     ...(geo ? { geo: { blocked: Boolean(geo.blocked), country: geo.country || '', region: geo.region || '', ip: geo.ip || '' } } : {}),
     ...(!order.skipped ? { order } : {}),
     tradeExecuted,
-    pendingTrade: responsePendingTrade,
-    state: {
-      lastTradeBarClose: state.lastTradeBarClose,
-      tradesLastHour: state.tradeHistory.length,
-      positionUsd: state.positionUsd,
-      lastDirection: state.lastDirection,
-    },
+    pendingUnresolvedCount: (Array.isArray(execState.openTrades) ? execState.openTrades : []).filter((t) => t.status === 'open').length,
+    openTradesSummary: summarizeOpenTrades(execState),
+    exitAttempted,
+    exitEligibleCount,
+    exitResult,
   };
-  if (tradeExecuted) {
-    execState.lastBucketKeyPlaced = bucketKey;
-    execState.filledBuckets[String(bucketKey)] = true;
-  }
   state.lastRun = resp;
   await saveStateToDisk().catch(() => {});
   await saveExecuteState(execState);
