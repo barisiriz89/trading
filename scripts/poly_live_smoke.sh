@@ -92,7 +92,7 @@ if (j.get("order") or {}).get("reason") == "live_not_enabled":
     raise SystemExit("FAIL: gate-on testinde live_not_enabled olmamali")
 if j.get("tradeExecuted") is not True:
     reason = j.get("reason")
-    if reason not in {"geoblock", "api_key_create_failed", "clob_error", "invalid_fee_rate", "fee_rate_unavailable", "gtc_unfilled_after_retries", "already_filled_this_bucket", "reconcile_unavailable", "max_step_reached_reset_pause", "below_min_size", "dry_run_gate", "missing_private_key", "max_position_usd", "cooldown_active", "max_trades_per_hour", "pending_unresolved_base_stake", "open_trades_cap_reached", "paused"}:
+    if reason not in {"geoblock", "api_key_create_failed", "clob_error", "fok_unfilled", "fok_unfilled_fallback_gtc", "invalid_fee_rate", "fee_rate_unavailable", "gtc_unfilled_after_retries", "already_filled_this_bucket", "reconcile_unavailable", "max_step_reached_reset_pause", "below_min_size", "dry_run_gate", "missing_private_key", "max_position_usd", "cooldown_active", "max_trades_per_hour", "pending_unresolved_base_stake", "open_trades_cap_reached", "paused"}:
         raise SystemExit(f"FAIL: gate-on blocker reason beklenmiyor: {reason}")
 required=["rid","decision","mode","dryRun","tradeExecuted","deduped","reason"]
 for key in required:
@@ -111,7 +111,7 @@ with open(sys.argv[1],"r",encoding="utf-8") as f:
 if j.get("deduped") is True and j.get("reason") == "already_filled_this_bucket":
     raise SystemExit(0)
 reason = j.get("reason")
-if reason not in {"already_filled_this_bucket", "reconcile_unavailable", "max_step_reached_reset_pause", "gtc_unfilled_after_retries", "dry_run_gate", "geoblock", "api_key_create_failed", "clob_error", "invalid_fee_rate", "fee_rate_unavailable", "missing_private_key", "max_position_usd", "cooldown_active", "max_trades_per_hour", "pending_unresolved_base_stake", "open_trades_cap_reached", "paused"}:
+if reason not in {"already_filled_this_bucket", "reconcile_unavailable", "max_step_reached_reset_pause", "gtc_unfilled_after_retries", "fok_unfilled", "fok_unfilled_fallback_gtc", "dry_run_gate", "geoblock", "api_key_create_failed", "clob_error", "invalid_fee_rate", "fee_rate_unavailable", "missing_private_key", "max_position_usd", "cooldown_active", "max_trades_per_hour", "pending_unresolved_base_stake", "open_trades_cap_reached", "paused"}:
     raise SystemExit("FAIL: ikinci gate-on cagrida dedupe veya kabul edilen blocker reason bekleniyordu")
 PY
 

@@ -46,7 +46,7 @@ const ENV = {
   POLY_SIZE_MULT: Number(process.env.POLY_SIZE_MULT || 2),
   POLY_MAX_NOTIONAL_USD: Number(process.env.POLY_MAX_NOTIONAL_USD || 16),
   POLY_FEE_RATE_BPS_RAW: String(process.env.POLY_FEE_RATE_BPS || '').trim(),
-  POLY_ORDER_TYPE: String(process.env.POLY_ORDER_TYPE || 'FOK').trim().toUpperCase(),
+  POLY_ORDER_TYPE: String(process.env.POLY_ORDER_TYPE || 'GTC').trim().toUpperCase(),
   POLY_GTC_TTL_MS: Number(process.env.POLY_GTC_TTL_MS || 30000),
   POLY_GTC_MAX_ATTEMPTS: Number(process.env.POLY_GTC_MAX_ATTEMPTS || 3),
   POLY_GTC_POLL_MS: Number(process.env.POLY_GTC_POLL_MS || 800),
@@ -69,6 +69,7 @@ const ENV = {
   POLY_MAKER_DECIMALS: Number(process.env.POLY_MAKER_DECIMALS || 2),
   POLY_TAKER_DECIMALS: Number(process.env.POLY_TAKER_DECIMALS || 4),
   POLY_API_CREDS_TTL_MS: Number(process.env.POLY_API_CREDS_TTL_MS || (55 * 60 * 1000)),
+  POLY_DISABLE_FOK_FALLBACK: String(process.env.POLY_DISABLE_FOK_FALLBACK || 'false').toLowerCase() === 'true',
   POLY_RECONCILE_FIXTURE: String(process.env.POLY_RECONCILE_FIXTURE || '').trim(),
   POLY_DEBUG_STATE: String(process.env.POLY_DEBUG_STATE || 'false').toLowerCase() === 'true',
   POLY_STATE_COLLECTION: String(process.env.POLY_STATE_COLLECTION || 'polymarketBotState').trim(),
@@ -847,7 +848,7 @@ function parseForceFillPriceSteps(midPrice) {
 }
 
 function resolveOrderType(mod, orderTypeName = ENV.POLY_ORDER_TYPE) {
-  const t = String(orderTypeName || 'FOK').toUpperCase();
+  const t = String(orderTypeName || 'GTC').toUpperCase();
   if (t === 'FOK') return mod?.OrderType?.FOK || 'FOK';
   if (t === 'GTD') return mod?.OrderType?.GTD || 'GTD';
   return mod?.OrderType?.GTC || 'GTC';
@@ -1227,6 +1228,17 @@ function normalizeClobErrorReason(err) {
   }
 
   const msg = safeMsg.toLowerCase();
+  if (
+    msg.includes('fully filled or killed')
+    || msg.includes("couldn't be fully filled")
+    || msg.includes('could not be fully filled')
+  ) {
+    return {
+      reason: 'fok_unfilled',
+      upstreamStatus: statusCode ?? 400,
+      upstreamMessage: safeMsg || 'order could not be fully filled',
+    };
+  }
   if (msg.includes('trading restricted in your region') || msg.includes('geoblock')) {
     return { reason: 'geoblock', upstreamStatus: statusCode ?? 403, upstreamMessage: 'trading restricted in your region' };
   }
@@ -1359,6 +1371,8 @@ async function placeOutcomeOrder({
   bucketKey,
   conditionId,
   fallbackTakerBaseFee,
+  orderTypeOverride = null,
+  disableFokFallback = false,
 }) {
   const orderSide = String(side || 'BUY').toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
   if (orderSide === 'SELL') {
@@ -1429,7 +1443,7 @@ async function placeOutcomeOrder({
     const amountUsdNum = normalizeUsdAmount(notionalUSD);
     if (!Number.isFinite(amountUsdNum) || amountUsdNum <= 0) throw new Error('invalid_notional_usd');
 
-    const configuredOrderType = String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase();
+    const configuredOrderType = String(orderTypeOverride || ENV.POLY_ORDER_TYPE || 'GTC').toUpperCase();
     const canUseClientConvenience = typeof client.createAndPostMarketOrder === 'function';
     const feeResolved = feeOverride.hasOverride
       ? { feeRateBps: feeOverride.feeRateBps, feeSource: 'override', feeRaw: feeOverride.feeRateBps }
@@ -1847,6 +1861,37 @@ async function placeOutcomeOrder({
           };
         }
       }
+      if (
+        configuredOrderType === 'FOK'
+        && mapped.reason === 'fok_unfilled'
+        && !disableFokFallback
+        && !ENV.POLY_DISABLE_FOK_FALLBACK
+      ) {
+        const gtcFallback = await placeOutcomeOrder({
+          outcome,
+          tokenId,
+          side: orderSide,
+          notionalUSD,
+          clientOrderId,
+          mode,
+          dryRun,
+          midPrice,
+          runRid,
+          decision,
+          bucketKey,
+          conditionId,
+          fallbackTakerBaseFee,
+          orderTypeOverride: 'GTC',
+          disableFokFallback: true,
+        });
+        return {
+          ...gtcFallback,
+          reason: 'fok_unfilled_fallback_gtc',
+          orderType: 'GTC',
+          upstreamStatus: gtcFallback.upstreamStatus ?? mapped.upstreamStatus ?? null,
+          upstreamMessage: gtcFallback.upstreamMessage || mapped.upstreamMessage || null,
+        };
+      }
       return {
         skipped: true,
         reason: mapped.reason,
@@ -1904,7 +1949,7 @@ async function placeOutcomeOrder({
       feeRateBpsUsed: Number.isInteger(feeOverride?.feeRateBps) ? feeOverride.feeRateBps : 0,
       feeSource: Number.isInteger(feeOverride?.feeRateBps) ? 'override' : 'default_zero',
       feeRaw: Number.isInteger(feeOverride?.feeRateBps) ? feeOverride.feeRateBps : null,
-      orderType: String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
+      orderType: String(ENV.POLY_ORDER_TYPE || 'GTC').toUpperCase(),
       bucketKey,
       attemptCount: 1,
       ttlMs: null,
@@ -2651,7 +2696,7 @@ async function runExecute(body, requestRid) {
   });
 
   let tradeExecuted = false;
-  let reason = order.skipped ? order.reason : 'trade_executed';
+  let reason = order.reason || (order.skipped ? 'order_skipped' : 'trade_executed');
   if (!order.skipped) {
     tradeExecuted = true;
     execState.openTrades = [...(Array.isArray(execState.openTrades) ? execState.openTrades : []), {
@@ -2688,7 +2733,7 @@ async function runExecute(body, requestRid) {
   const feeRateBpsUsed = Number.isInteger(order?.feeRateBpsUsed) ? order.feeRateBpsUsed : null;
   const feeSource = typeof order?.feeSource === 'string' ? order.feeSource : null;
   const feeRaw = order?.feeRaw ?? null;
-  const orderType = typeof order?.orderType === 'string' ? order.orderType : String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase();
+  const orderType = typeof order?.orderType === 'string' ? order.orderType : String(ENV.POLY_ORDER_TYPE || 'GTC').toUpperCase();
   const attemptCount = Number.isFinite(order?.attemptCount) ? Number(order.attemptCount) : 0;
   const ttlMs = Number.isFinite(order?.ttlMs) ? Number(order.ttlMs) : null;
   const orderStatus = typeof order?.status === 'string' ? order.status : null;
