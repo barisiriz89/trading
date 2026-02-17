@@ -5,9 +5,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   chooseBtcUpDownMarketFromEvents,
+  computeExecuteNotional,
   computeQuorumDecision,
   extractUpDownTokens,
   intervalKeyFromTsMs,
+  isLiveExecutionEnabled,
   makeExecuteDedupKey,
   parseJsonArrayLike,
   validateExecutePayload,
@@ -36,6 +38,12 @@ const ENV = {
   POLY_PRIVATE_KEY: String(process.env.POLY_PRIVATE_KEY || '').trim(),
   POLY_FUNDER_ADDRESS: String(process.env.POLY_FUNDER_ADDRESS || '').trim(),
   POLY_TV_SECRET: String(process.env.POLY_TV_SECRET || '').trim(),
+  POLY_LIVE_ENABLED: String(process.env.POLY_LIVE_ENABLED || 'false').toLowerCase() === 'true',
+  POLY_LIVE_CONFIRM: String(process.env.POLY_LIVE_CONFIRM || '').trim(),
+  POLY_AUTO_SIZE: String(process.env.POLY_AUTO_SIZE || 'false').toLowerCase() === 'true',
+  POLY_START_NOTIONAL_USD: Number(process.env.POLY_START_NOTIONAL_USD || 1),
+  POLY_SIZE_MULT: Number(process.env.POLY_SIZE_MULT || 2),
+  POLY_MAX_NOTIONAL_USD: Number(process.env.POLY_MAX_NOTIONAL_USD || 16),
 };
 
 const BAR_SEC = 300;
@@ -46,6 +54,7 @@ const state = {
     slug: ENV.POLY_MARKET_SLUG,
     yesTokenId: ENV.POLY_YES_TOKEN_ID,
     noTokenId: ENV.POLY_NO_TOKEN_ID,
+    orderMinSize: null,
     loadedAtTs: null,
   },
   lastTradeBarClose: null,
@@ -53,6 +62,7 @@ const state = {
   positionUsd: 0,
   lastDirection: 'FLAT',
   lastRun: null,
+  autoSizeStep: 0,
 };
 
 const marketCache = {
@@ -159,6 +169,20 @@ function cacheMarketEntry(entry, nowMs) {
   return normalized;
 }
 
+function readOrderMinSize(market) {
+  const candidates = [
+    market?.orderMinSize,
+    market?.minimumOrderSize,
+    market?.minOrderSize,
+    market?.min_size,
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
 async function resolveUpDownMarket(marketSlug, nowMs = Date.now()) {
   const override = resolveEnvTokenOverrides();
   if (override) {
@@ -166,6 +190,7 @@ async function resolveUpDownMarket(marketSlug, nowMs = Date.now()) {
       slug: marketSlug || ENV.POLY_MARKET_SLUG || 'env-override',
       yesTokenId: override.yesTokenId,
       noTokenId: override.noTokenId,
+      orderMinSize: null,
     }, nowMs);
   }
 
@@ -177,7 +202,7 @@ async function resolveUpDownMarket(marketSlug, nowMs = Date.now()) {
     const market = Array.isArray(payload) ? payload[0] : payload;
     if (!market || !market.slug) throw new Error(`market slug not found: ${marketSlug}`);
     const { yesTokenId, noTokenId } = extractUpDownTokens(market);
-    return cacheMarketEntry({ slug: String(market.slug), yesTokenId, noTokenId }, nowMs);
+    return cacheMarketEntry({ slug: String(market.slug), yesTokenId, noTokenId, orderMinSize: readOrderMinSize(market) }, nowMs);
   }
 
   if (marketCache.latestAuto && (nowMs - marketCache.latestAuto.cachedAtMs <= 20000)) {
@@ -191,6 +216,7 @@ async function resolveUpDownMarket(marketSlug, nowMs = Date.now()) {
     slug: selected.slug,
     yesTokenId: selected.yesTokenId,
     noTokenId: selected.noTokenId,
+    orderMinSize: readOrderMinSize(selected.market),
   }, nowMs);
 }
 
@@ -432,6 +458,22 @@ function guardrailReason({ decision, barCloseTs, nowTs, notionalUSD = ENV.POLY_O
   return null;
 }
 
+function isLiveGateEnabled() {
+  return isLiveExecutionEnabled(ENV.POLY_LIVE_ENABLED, ENV.POLY_LIVE_CONFIRM);
+}
+
+function computeExecuteSizing(requestNotionalUSD, marketOrderMinSize) {
+  return computeExecuteNotional({
+    autoSize: ENV.POLY_AUTO_SIZE,
+    startNotionalUSD: ENV.POLY_START_NOTIONAL_USD,
+    sizeMult: ENV.POLY_SIZE_MULT,
+    maxNotionalUSD: ENV.POLY_MAX_NOTIONAL_USD,
+    step: state.autoSizeStep,
+    requestNotionalUSD,
+    orderMinSize: marketOrderMinSize,
+  });
+}
+
 function makeClientOrderId(slug, barCloseTs, direction) {
   const safeSlug = String(slug || 'market').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48);
   return `${ENV.POLY_STRATEGY_VERSION}:${safeSlug}:${barCloseTs}:${direction}`;
@@ -492,6 +534,14 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
     return {
       skipped: true,
       reason: 'mode_test',
+      intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+    };
+  }
+
+  if (mode === 'live' && !isLiveGateEnabled()) {
+    return {
+      skipped: true,
+      reason: 'live_not_enabled',
       intent: { side: 'BUY', tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
     };
   }
@@ -719,87 +769,99 @@ async function runExecute(body, requestRid) {
 
   const market = await resolveUpDownMarket(req.marketSlug, nowMs);
   const tokenId = decision === 'UP' ? market.yesTokenId : decision === 'DOWN' ? market.noTokenId : null;
+  const sizing = computeExecuteSizing(req.notionalUSD, market.orderMinSize);
 
-  const logBase = {
-    ts: new Date().toISOString(),
+  const base = {
+    ok: true,
     rid: requestRid,
+    ts: new Date().toISOString(),
     marketSlug: market.slug,
     decision,
-    voteSummary: quorum.voteSummary,
     outcome,
     tokenId,
+    voteCounts: quorum.counts,
+    voteSummary: quorum.voteSummary,
+    intervalKey,
+    dryRun: ENV.POLY_DRY_RUN,
+    killSwitch: ENV.POLY_KILL_SWITCH,
+    sizing: {
+      auto: sizing.auto,
+      step: sizing.step,
+      computedNotionalUSD: sizing.computedNotionalUSD,
+      max: sizing.max,
+      adjustedToMin: sizing.adjustedToMin,
+      orderMinSize: sizing.orderMinSize,
+    },
+  };
+
+  const logDecision = (resp) => {
+    decisionLog({
+      rid: requestRid,
+      marketSlug: market.slug,
+      decision,
+      mode: req.mode,
+      dryRun: resp?.dryRun,
+      tradeExecuted: Boolean(resp?.tradeExecuted),
+      deduped: Boolean(resp?.deduped),
+      computedNotionalUSD: sizing.computedNotionalUSD,
+    });
   };
 
   if (decision === 'NO_TRADE') {
-    console.log('DECISION:', JSON.stringify({ ...logBase, reason: 'no_quorum' }));
     const resp = {
-      ok: true,
-      rid: requestRid,
-      ts: logBase.ts,
-      marketSlug: market.slug,
-      decision,
+      ...base,
       deduped: false,
       reason: 'no_quorum',
-      outcome,
       tokenId: null,
-      voteCounts: quorum.counts,
-      voteSummary: quorum.voteSummary,
-      dryRun: ENV.POLY_DRY_RUN,
-      killSwitch: ENV.POLY_KILL_SWITCH,
+      tradeExecuted: false,
     };
     state.lastRun = resp;
     await saveStateToDisk().catch(() => {});
+    logDecision(resp);
     return resp;
   }
 
   purgeDedup(nowMs);
   const dedupKey = makeExecuteDedupKey(market.slug, intervalKey, decision);
   if (executeDedup.has(dedupKey)) {
-    console.log('DECISION:', JSON.stringify({ ...logBase, reason: 'deduped', dedupKey }));
-    return {
-      ok: true,
-      rid: requestRid,
-      ts: logBase.ts,
-      marketSlug: market.slug,
-      decision,
+    const resp = {
+      ...base,
       deduped: true,
       dedupKey,
-      outcome,
-      tokenId,
-      voteCounts: quorum.counts,
-      voteSummary: quorum.voteSummary,
-      dryRun: ENV.POLY_DRY_RUN,
-      killSwitch: ENV.POLY_KILL_SWITCH,
+      reason: 'deduped',
+      tradeExecuted: false,
     };
+    state.lastRun = resp;
+    await saveStateToDisk().catch(() => {});
+    logDecision(resp);
+    return resp;
   }
   executeDedup.set(dedupKey, { tsMs: nowMs });
 
   const barCloseTs = Math.floor(req.ts / 1000 / BAR_SEC) * BAR_SEC;
-  const guardrail = guardrailReason({
-    decision,
-    barCloseTs,
-    nowTs: nowTsSec,
-    notionalUSD: req.notionalUSD,
-    mode: req.mode,
-  });
+  const skipForMin = sizing.belowOrderMinSize;
+  const guardrail = skipForMin
+    ? 'below_order_min_size'
+    : guardrailReason({
+      decision,
+      barCloseTs,
+      nowTs: nowTsSec,
+      notionalUSD: sizing.computedNotionalUSD,
+      mode: req.mode,
+    });
 
   if (guardrail) {
-    console.log('DECISION:', JSON.stringify({ ...logBase, reason: guardrail, dedupKey }));
     const resp = {
-      ok: true,
-      rid: requestRid,
-      ts: logBase.ts,
-      marketSlug: market.slug,
-      decision,
+      ...base,
       deduped: false,
       dedupKey,
       reason: guardrail,
-      outcome,
-      tokenId,
-      voteCounts: quorum.counts,
-      voteSummary: quorum.voteSummary,
-      dryRun: ENV.POLY_DRY_RUN,
-      killSwitch: ENV.POLY_KILL_SWITCH,
+      order: {
+        skipped: true,
+        reason: guardrail,
+        intent: { side: 'BUY', tokenId, outcome, amountUsd: sizing.computedNotionalUSD, clientOrderId: req.clientOrderId, midPrice: null },
+      },
+      tradeExecuted: false,
       state: {
         lastTradeBarClose: state.lastTradeBarClose,
         tradesLastHour: state.tradeHistory.length,
@@ -809,6 +871,7 @@ async function runExecute(body, requestRid) {
     };
     state.lastRun = resp;
     await saveStateToDisk().catch(() => {});
+    logDecision(resp);
     return resp;
   }
 
@@ -816,7 +879,7 @@ async function runExecute(body, requestRid) {
   const order = await placeOutcomeOrder({
     outcome,
     tokenId,
-    notionalUSD: req.notionalUSD,
+    notionalUSD: sizing.computedNotionalUSD,
     clientOrderId: req.clientOrderId,
     mode: req.mode,
     midPrice,
@@ -828,29 +891,18 @@ async function runExecute(body, requestRid) {
     state.lastTradeBarClose = barCloseTs;
     state.tradeHistory.push({ ts: nowTsSec, direction: decision });
     trimHistoryInPlace(state.tradeHistory, nowTsSec);
-    state.positionUsd = Number((state.positionUsd + req.notionalUSD).toFixed(6));
+    state.positionUsd = Number((state.positionUsd + sizing.computedNotionalUSD).toFixed(6));
     state.lastDirection = decision;
+    if (ENV.POLY_AUTO_SIZE) state.autoSizeStep += 1;
   }
 
   const reason = order.skipped ? order.reason : 'trade_executed';
-  console.log('DECISION:', JSON.stringify({ ...logBase, reason, dedupKey }));
-
   const resp = {
-    ok: true,
-    rid: requestRid,
-    ts: logBase.ts,
-    marketSlug: market.slug,
-    decision,
+    ...base,
     deduped: false,
     dedupKey,
     reason,
-    outcome,
-    tokenId,
-    voteCounts: quorum.counts,
     voteSummary: quorum.voteSummary,
-    intervalKey,
-    dryRun: ENV.POLY_DRY_RUN,
-    killSwitch: ENV.POLY_KILL_SWITCH,
     order,
     tradeExecuted,
     state: {
@@ -862,6 +914,7 @@ async function runExecute(body, requestRid) {
   };
   state.lastRun = resp;
   await saveStateToDisk().catch(() => {});
+  logDecision(resp);
   return resp;
 }
 

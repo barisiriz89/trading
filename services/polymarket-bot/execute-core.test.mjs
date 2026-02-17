@@ -2,9 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chooseBtcUpDownMarketFromEvents,
+  computeExecuteNotional,
   computeQuorumDecision,
   extractUpDownTokens,
   intervalKeyFromTsMs,
+  isLiveExecutionEnabled,
   makeExecuteDedupKey,
   parseJsonArrayLike,
   validateExecutePayload,
@@ -126,4 +128,61 @@ test('dedup key uses slug + 5m interval + decision', () => {
   const interval = intervalKeyFromTsMs(ts);
   const key = makeExecuteDedupKey('btc-updown-5m-1771368900', interval, 'UP');
   assert.equal(key, 'btc-updown-5m-1771368900:5904563:UP');
+});
+
+test('live execution gate requires explicit enable + confirm', () => {
+  assert.equal(isLiveExecutionEnabled(false, 'I_UNDERSTAND'), false);
+  assert.equal(isLiveExecutionEnabled(true, ''), false);
+  assert.equal(isLiveExecutionEnabled(true, 'I_UNDERSTAND'), true);
+});
+
+test('auto sizing ladder computes, caps, and adjusts to order min size', () => {
+  const base = computeExecuteNotional({
+    autoSize: true,
+    startNotionalUSD: 1,
+    sizeMult: 2,
+    maxNotionalUSD: 16,
+    step: 3,
+    requestNotionalUSD: 5,
+    orderMinSize: null,
+  });
+  assert.equal(base.computedNotionalUSD, 8);
+  assert.equal(base.adjustedToMin, false);
+
+  const capped = computeExecuteNotional({
+    autoSize: true,
+    startNotionalUSD: 1,
+    sizeMult: 2,
+    maxNotionalUSD: 16,
+    step: 99,
+    requestNotionalUSD: 5,
+    orderMinSize: null,
+  });
+  assert.equal(capped.computedNotionalUSD, 16);
+
+  const raisedToMin = computeExecuteNotional({
+    autoSize: true,
+    startNotionalUSD: 1,
+    sizeMult: 2,
+    maxNotionalUSD: 16,
+    step: 0,
+    requestNotionalUSD: 5,
+    orderMinSize: 3,
+  });
+  assert.equal(raisedToMin.computedNotionalUSD, 3);
+  assert.equal(raisedToMin.adjustedToMin, true);
+  assert.equal(raisedToMin.belowOrderMinSize, false);
+
+  const belowMin = computeExecuteNotional({
+    autoSize: true,
+    startNotionalUSD: 1,
+    sizeMult: 2,
+    maxNotionalUSD: 2,
+    step: 0,
+    requestNotionalUSD: 5,
+    orderMinSize: 3,
+  });
+  assert.equal(belowMin.computedNotionalUSD, 1);
+  assert.equal(belowMin.adjustedToMin, false);
+  assert.equal(belowMin.belowOrderMinSize, true);
 });

@@ -216,3 +216,49 @@ export function intervalKeyFromTsMs(tsMs) {
 export function makeExecuteDedupKey(marketSlug, intervalKey, decision) {
   return `${marketSlug}:${intervalKey}:${decision}`;
 }
+
+export function isLiveExecutionEnabled(liveEnabled, liveConfirm) {
+  return Boolean(liveEnabled) && String(liveConfirm || '') === 'I_UNDERSTAND';
+}
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+export function computeExecuteNotional({
+  autoSize = false,
+  startNotionalUSD = 1,
+  sizeMult = 2,
+  maxNotionalUSD = 16,
+  step = 0,
+  requestNotionalUSD = 1,
+  orderMinSize = null,
+}) {
+  const start = Number.isFinite(Number(startNotionalUSD)) && Number(startNotionalUSD) > 0 ? Number(startNotionalUSD) : 1;
+  const mult = Number.isFinite(Number(sizeMult)) && Number(sizeMult) > 0 ? Number(sizeMult) : 2;
+  const max = Number.isFinite(Number(maxNotionalUSD)) && Number(maxNotionalUSD) > 0 ? Number(maxNotionalUSD) : 16;
+  const safeStep = Math.max(0, Number(step) || 0);
+
+  let computedNotionalUSD = autoSize
+    ? clamp(start * (mult ** safeStep), start, max)
+    : Number(requestNotionalUSD);
+
+  const minSize = Number(orderMinSize);
+  let adjustedToMin = false;
+  if (Number.isFinite(minSize) && minSize > 0 && computedNotionalUSD < minSize && minSize <= max) {
+    computedNotionalUSD = minSize;
+    adjustedToMin = true;
+  }
+
+  const belowOrderMinSize = Number.isFinite(minSize) && minSize > 0 && computedNotionalUSD < minSize;
+
+  return {
+    auto: Boolean(autoSize),
+    step: safeStep,
+    computedNotionalUSD: Number(computedNotionalUSD),
+    max,
+    adjustedToMin,
+    orderMinSize: Number.isFinite(minSize) && minSize > 0 ? minSize : null,
+    belowOrderMinSize,
+  };
+}
