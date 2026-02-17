@@ -69,6 +69,8 @@ const ENV = {
   POLY_MAKER_DECIMALS: Number(process.env.POLY_MAKER_DECIMALS || 2),
   POLY_TAKER_DECIMALS: Number(process.env.POLY_TAKER_DECIMALS || 4),
   POLY_API_CREDS_TTL_MS: Number(process.env.POLY_API_CREDS_TTL_MS || (55 * 60 * 1000)),
+  POLY_RECONCILE_FIXTURE: String(process.env.POLY_RECONCILE_FIXTURE || '').trim(),
+  POLY_DEBUG_STATE: String(process.env.POLY_DEBUG_STATE || 'false').toLowerCase() === 'true',
   POLY_STATE_COLLECTION: String(process.env.POLY_STATE_COLLECTION || 'polymarketBotState').trim(),
 };
 
@@ -118,6 +120,7 @@ const DEFAULT_EXECUTE_STATE = {
   lastBucketKeyPlaced: null, // legacy compatibility
   filledBuckets: {},
   openTrades: [],
+  resolvedTrades: [],
   pausedUntilBucket: null,
   lastResolvedBucketKey: null,
 };
@@ -242,6 +245,25 @@ async function loadExecuteState(envName, market) {
         exit: x.exit && typeof x.exit === 'object' ? x.exit : null,
         settlement: x.settlement && typeof x.settlement === 'object' ? x.settlement : null,
       }));
+    const resolvedTradesRaw = Array.isArray(data.resolvedTrades) ? data.resolvedTrades : [];
+    const resolvedTrades = resolvedTradesRaw
+      .filter((x) => x && typeof x === 'object')
+      .slice(-50)
+      .map((x) => ({
+        bucketKey: Number.isFinite(Number(x.bucketKey)) ? Number(x.bucketKey) : null,
+        conditionId: String(x.conditionId || ''),
+        marketSlug: String(x.marketSlug || ''),
+        decision: String(x.decision || '').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP',
+        tokenId: String(x.tokenId || ''),
+        notionalUSD: Math.max(0, safeNum(x.notionalUSD, 0)),
+        resolvedAtMs: Number.isFinite(Number(x.resolvedAtMs)) ? Number(x.resolvedAtMs) : Date.now(),
+        outcomeWinner: String(x.outcomeWinner || ''),
+        result: String(x.result || ''),
+        stepBefore: Number.isFinite(Number(x.stepBefore)) ? Number(x.stepBefore) : null,
+        stepAfter: Number.isFinite(Number(x.stepAfter)) ? Number(x.stepAfter) : null,
+        lossStreakBefore: Number.isFinite(Number(x.lossStreakBefore)) ? Number(x.lossStreakBefore) : null,
+        lossStreakAfter: Number.isFinite(Number(x.lossStreakAfter)) ? Number(x.lossStreakAfter) : null,
+      }));
     if (!openTrades.length && data.pendingTrade && typeof data.pendingTrade === 'object') {
       const p = data.pendingTrade;
       openTrades.push({
@@ -266,6 +288,7 @@ async function loadExecuteState(envName, market) {
       lastBucketKeyPlaced: Number.isFinite(Number(data.lastBucketKeyPlaced)) ? Number(data.lastBucketKeyPlaced) : null,
       filledBuckets,
       openTrades,
+      resolvedTrades,
       pausedUntilBucket: Number.isFinite(Number(data.pausedUntilBucket)) ? Number(data.pausedUntilBucket) : null,
       lastResolvedBucketKey: Number.isFinite(Number(data.lastResolvedBucketKey)) ? Number(data.lastResolvedBucketKey) : null,
       _docId: docId,
@@ -287,6 +310,7 @@ async function saveExecuteState(execState) {
       lastBucketKeyPlaced: Number.isFinite(Number(execState.lastBucketKeyPlaced)) ? Number(execState.lastBucketKeyPlaced) : null,
       filledBuckets: execState.filledBuckets && typeof execState.filledBuckets === 'object' ? execState.filledBuckets : {},
       openTrades: Array.isArray(execState.openTrades) ? execState.openTrades : [],
+      resolvedTrades: Array.isArray(execState.resolvedTrades) ? execState.resolvedTrades.slice(-50) : [],
       pausedUntilBucket: Number.isFinite(Number(execState.pausedUntilBucket)) ? Number(execState.pausedUntilBucket) : null,
       lastResolvedBucketKey: Number.isFinite(Number(execState.lastResolvedBucketKey)) ? Number(execState.lastResolvedBucketKey) : null,
       updatedAtMs: Date.now(),
@@ -1914,6 +1938,26 @@ function normalizeExecState(execState) {
       exit: x.exit && typeof x.exit === 'object' ? x.exit : null,
       settlement: x.settlement && typeof x.settlement === 'object' ? x.settlement : null,
     }));
+  const resolvedTrades = Array.isArray(execState?.resolvedTrades)
+    ? execState.resolvedTrades
+      .filter((x) => x && typeof x === 'object')
+      .slice(-50)
+      .map((x) => ({
+        bucketKey: Number.isFinite(Number(x.bucketKey)) ? Number(x.bucketKey) : null,
+        conditionId: String(x.conditionId || ''),
+        marketSlug: String(x.marketSlug || ''),
+        decision: String(x.decision || '').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP',
+        tokenId: String(x.tokenId || ''),
+        notionalUSD: Math.max(0, safeNum(x.notionalUSD, 0)),
+        resolvedAtMs: Number.isFinite(Number(x.resolvedAtMs)) ? Number(x.resolvedAtMs) : Date.now(),
+        outcomeWinner: String(x.outcomeWinner || ''),
+        result: String(x.result || ''),
+        stepBefore: Number.isFinite(Number(x.stepBefore)) ? Number(x.stepBefore) : null,
+        stepAfter: Number.isFinite(Number(x.stepAfter)) ? Number(x.stepAfter) : null,
+        lossStreakBefore: Number.isFinite(Number(x.lossStreakBefore)) ? Number(x.lossStreakBefore) : null,
+        lossStreakAfter: Number.isFinite(Number(x.lossStreakAfter)) ? Number(x.lossStreakAfter) : null,
+      }))
+    : [];
   return {
     ...DEFAULT_EXECUTE_STATE,
     ...execState,
@@ -1925,50 +1969,238 @@ function normalizeExecState(execState) {
     pausedUntilBucket: Number.isFinite(Number(execState?.pausedUntilBucket)) ? Number(execState.pausedUntilBucket) : null,
     filledBuckets,
     openTrades: normalizedOpenTrades,
+    resolvedTrades,
   };
 }
 
-async function reconcileExecuteState(execState, currentBucketKey) {
+async function reconcileExecuteState(execState, currentBucketKey, opts = {}) {
+  const allowFixture = opts.allowFixture !== false;
   const next = normalizeExecState(execState);
   const openTrades = Array.isArray(next.openTrades) ? next.openTrades : [];
   const unresolved = openTrades
     .filter((t) => t.status === 'open' && Number.isFinite(Number(t.bucketKey)) && Number(t.bucketKey) < currentBucketKey)
     .sort((a, b) => Number(a.bucketKey) - Number(b.bucketKey));
 
-  let reconcileReason = null;
-  let changed = false;
-  for (const trade of unresolved) {
+  const reconcileResult = {
+    status: 'no_pending',
+    pendingBucketKey: null,
+    conditionId: null,
+    marketSlug: null,
+    winner: null,
+    result: null,
+    stepBefore: null,
+    stepAfter: null,
+    lossStreakBefore: null,
+    lossStreakAfter: null,
+    upstreamStatus: null,
+    upstreamMessage: null,
+  };
+  if (!unresolved.length) {
+    return { state: next, reconcileReason: null, pendingResolved: false, reconcileAttempted: false, reconcileResult };
+  }
+
+  const trade = unresolved[0];
+  reconcileResult.pendingBucketKey = Number.isFinite(Number(trade.bucketKey)) ? Number(trade.bucketKey) : null;
+  reconcileResult.conditionId = String(trade.conditionId || '') || null;
+  reconcileResult.marketSlug = String(trade.marketSlug || '') || null;
+  reconcileResult.status = 'unresolved';
+
+  const readFixtureMarket = async () => {
+    if (!ENV.POLY_RECONCILE_FIXTURE) return null;
     try {
-      const payload = await fetchJson(`${ENV.POLY_GAMMA_HOST}/markets/slug/${encodeURIComponent(trade.marketSlug)}`);
-      const market = Array.isArray(payload) ? payload[0] : payload;
-      if (!market || !market.closed) continue;
-      const winner = deriveWinnerFromOutcomePrices(market);
-      if (!winner || (winner !== 'UP' && winner !== 'DOWN')) {
-        reconcileReason = reconcileReason || 'reconcile_unavailable';
-        continue;
-      }
-      const settled = applySettlementOutcome(next, trade, winner, currentBucketKey, LADDER.length - 1);
-      next.step = settled.state.step;
-      next.lossStreak = settled.state.lossStreak;
-      next.cumulativeLossUSD = settled.state.cumulativeLossUSD;
-      next.pausedUntilBucket = settled.state.pausedUntilBucket ?? next.pausedUntilBucket;
-      next.lastResolvedBucketKey = Number.isFinite(Number(trade.bucketKey)) ? Number(trade.bucketKey) : next.lastResolvedBucketKey;
-      trade.status = 'settled';
-      trade.settlement = {
-        resolvedAtMs: Date.now(),
-        winningSide: winner,
-        winBool: winner === trade.side,
-      };
-      changed = true;
-      reconcileReason = settled.reason;
+      const raw = await fs.readFile(ENV.POLY_RECONCILE_FIXTURE, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      return parsed;
     } catch {
-      reconcileReason = reconcileReason || 'reconcile_unavailable';
+      return null;
     }
-  }
-  if (changed) {
+  };
+
+  const extractWinnerFromMarket = (marketLike) => {
+    const market = marketLike && typeof marketLike === 'object' ? marketLike : {};
+    const outcomes = parseJsonArrayLike(market?.outcomes).map((x) => String(x || '').trim());
+    const lower = outcomes.map((x) => x.toLowerCase());
+    const winnerDirect = String(
+      market?.winner || market?.winningOutcome || market?.resolvedOutcome || market?.outcome || '',
+    ).trim().toLowerCase();
+    if (winnerDirect === 'up' || winnerDirect === 'down') return winnerDirect.toUpperCase();
+    const winningIndexes = [
+      market?.winningOutcomeIndex,
+      market?.winnerIndex,
+      market?.resolvedOutcomeIndex,
+    ].map((x) => Number(x)).filter((x) => Number.isInteger(x) && x >= 0);
+    if (winningIndexes.length && outcomes[winningIndexes[0]]) {
+      const label = String(outcomes[winningIndexes[0]] || '').trim().toLowerCase();
+      if (label === 'up' || label === 'down') return label.toUpperCase();
+    }
+    const upIdx = lower.indexOf('up');
+    const downIdx = lower.indexOf('down');
+    const prices = parseJsonArrayLike(market?.outcomePrices).map((x) => Number(x));
+    if (upIdx >= 0 && downIdx >= 0) {
+      const upP = Number(prices[upIdx]);
+      const downP = Number(prices[downIdx]);
+      if (Number.isFinite(upP) && Number.isFinite(downP) && upP !== downP) return upP > downP ? 'UP' : 'DOWN';
+    }
+    return null;
+  };
+
+  const deriveChosenOutcomeFromTrade = (tradeLike, marketLike) => {
+    const tradeSide = String(tradeLike?.side || '').toUpperCase() === 'DOWN' ? 'DOWN' : 'UP';
+    const tokenId = String(tradeLike?.tokenId || '');
+    const market = marketLike && typeof marketLike === 'object' ? marketLike : {};
+    const outcomes = parseJsonArrayLike(market?.outcomes).map((x) => String(x || '').trim().toLowerCase());
+    const tokenIds = parseJsonArrayLike(market?.clobTokenIds).map((x) => String(x || '').trim());
+    if (outcomes.length && tokenIds.length && tokenId) {
+      for (let i = 0; i < outcomes.length; i += 1) {
+        if (tokenIds[i] !== tokenId) continue;
+        if (outcomes[i] === 'up') return 'UP';
+        if (outcomes[i] === 'down') return 'DOWN';
+      }
+    }
+    return tradeSide;
+  };
+
+  const extractResolvedFromMarket = (marketLike) => {
+    const market = marketLike && typeof marketLike === 'object' ? marketLike : {};
+    const resolved = Boolean(
+      market?.resolved === true
+      || market?.closed === true
+      || market?.finalized === true
+      || market?.isResolved === true,
+    );
+    return {
+      resolved,
+      resolvedTime: safeNum(
+        market?.resolvedTime
+        ?? market?.resolvedAt
+        ?? market?.endDate
+        ?? market?.end_time
+        ?? market?.endTime,
+        Date.now(),
+      ),
+      winner: extractWinnerFromMarket(market),
+      market,
+    };
+  };
+
+  const fetchGammaResolution = async () => {
+    if (allowFixture && ENV.POLY_RECONCILE_FIXTURE) {
+      const fixture = await readFixtureMarket();
+      if (fixture) {
+        const out = extractResolvedFromMarket(fixture);
+        return { ...out, source: 'fixture' };
+      }
+    }
+    const errors = [];
+    if (trade.conditionId) {
+      const urlByCondition = `${ENV.POLY_GAMMA_HOST}/markets?condition_ids=${encodeURIComponent(trade.conditionId)}`;
+      try {
+        const payload = await fetchJson(urlByCondition);
+        const market = Array.isArray(payload) ? payload[0] : payload;
+        if (market && typeof market === 'object') return { ...extractResolvedFromMarket(market), source: 'gamma' };
+      } catch (err) {
+        errors.push(err);
+      }
+    }
+    if (trade.marketSlug) {
+      const urlBySlug = `${ENV.POLY_GAMMA_HOST}/markets/slug/${encodeURIComponent(trade.marketSlug)}`;
+      try {
+        const payload = await fetchJson(urlBySlug);
+        const market = Array.isArray(payload) ? payload[0] : payload;
+        if (market && typeof market === 'object') return { ...extractResolvedFromMarket(market), source: 'gamma' };
+      } catch (err) {
+        errors.push(err);
+      }
+    }
+    if (errors.length) throw errors[0];
+    return null;
+  };
+
+  const fetchClobResolution = async () => {
+    if (!trade.conditionId) return null;
+    try {
+      const payload = await fetchJson(`${ENV.POLY_CLOB_HOST}/markets/${encodeURIComponent(trade.conditionId)}`);
+      const market = payload && typeof payload === 'object' ? payload : null;
+      if (!market) return null;
+      return { ...extractResolvedFromMarket(market), source: 'clob' };
+    } catch (err) {
+      throw err;
+    }
+  };
+
+  try {
+    const primary = await fetchGammaResolution();
+    let settlement = primary;
+    if (!settlement?.resolved) {
+      const fallback = await fetchClobResolution().catch(() => null);
+      if (fallback) settlement = fallback;
+    }
+    if (!settlement) {
+      reconcileResult.status = 'unavailable';
+      reconcileResult.upstreamStatus = 503;
+      reconcileResult.upstreamMessage = 'reconcile unavailable: no gamma/clob data';
+      return { state: next, reconcileReason: 'reconcile_unavailable', pendingResolved: false, reconcileAttempted: true, reconcileResult };
+    }
+    if (!settlement.resolved) {
+      reconcileResult.status = 'unresolved';
+      reconcileResult.winner = null;
+      return { state: next, reconcileReason: null, pendingResolved: false, reconcileAttempted: true, reconcileResult };
+    }
+    if (!settlement.winner || (settlement.winner !== 'UP' && settlement.winner !== 'DOWN')) {
+      reconcileResult.status = 'unavailable';
+      reconcileResult.upstreamStatus = 500;
+      reconcileResult.upstreamMessage = 'reconcile unavailable: winner not found';
+      return { state: next, reconcileReason: 'reconcile_unavailable', pendingResolved: false, reconcileAttempted: true, reconcileResult };
+    }
+
+    const chosenOutcome = deriveChosenOutcomeFromTrade(trade, settlement.market);
+    const stepBefore = next.step;
+    const lossBefore = next.lossStreak;
+    const settled = applySettlementOutcome(next, { ...trade, side: chosenOutcome }, settlement.winner, currentBucketKey, LADDER.length - 1);
+    next.step = settled.state.step;
+    next.lossStreak = settled.state.lossStreak;
+    next.cumulativeLossUSD = settled.state.cumulativeLossUSD;
+    next.pausedUntilBucket = settled.state.pausedUntilBucket ?? next.pausedUntilBucket;
+    next.lastResolvedBucketKey = Number.isFinite(Number(trade.bucketKey)) ? Number(trade.bucketKey) : next.lastResolvedBucketKey;
+    trade.status = 'settled';
+    trade.settlement = {
+      resolvedAtMs: Number.isFinite(Number(settlement.resolvedTime)) ? Number(settlement.resolvedTime) : Date.now(),
+      winningSide: settlement.winner,
+      winBool: settlement.winner === chosenOutcome,
+    };
+    const resolvedRecord = {
+      bucketKey: Number.isFinite(Number(trade.bucketKey)) ? Number(trade.bucketKey) : null,
+      conditionId: String(trade.conditionId || ''),
+      marketSlug: String(trade.marketSlug || ''),
+      decision: chosenOutcome,
+      tokenId: String(trade.tokenId || ''),
+      notionalUSD: Math.max(0, safeNum(trade.notionalUSD, 0)),
+      resolvedAtMs: Number.isFinite(Number(settlement.resolvedTime)) ? Number(settlement.resolvedTime) : Date.now(),
+      outcomeWinner: settlement.winner,
+      result: settlement.winner === chosenOutcome ? 'WIN' : 'LOSS',
+      stepBefore,
+      stepAfter: next.step,
+      lossStreakBefore: lossBefore,
+      lossStreakAfter: next.lossStreak,
+    };
+    next.resolvedTrades = [...(Array.isArray(next.resolvedTrades) ? next.resolvedTrades : []), resolvedRecord].slice(-50);
     next.openTrades = openTrades;
+    reconcileResult.status = 'resolved';
+    reconcileResult.winner = settlement.winner;
+    reconcileResult.result = resolvedRecord.result;
+    reconcileResult.stepBefore = stepBefore;
+    reconcileResult.stepAfter = next.step;
+    reconcileResult.lossStreakBefore = lossBefore;
+    reconcileResult.lossStreakAfter = next.lossStreak;
+    return { state: next, reconcileReason: settled.reason, pendingResolved: true, reconcileAttempted: true, reconcileResult };
+  } catch (err) {
+    const mapped = normalizeClobErrorReason(err);
+    reconcileResult.status = 'unavailable';
+    reconcileResult.upstreamStatus = mapped.upstreamStatus ?? null;
+    reconcileResult.upstreamMessage = mapped.upstreamMessage || 'reconcile unavailable';
+    return { state: next, reconcileReason: 'reconcile_unavailable', pendingResolved: false, reconcileAttempted: true, reconcileResult };
   }
-  return { state: next, reconcileReason, pendingResolved: changed };
 }
 
 function computeRecoverySizing({ execState, marketOrderMinSize, forceBaseStake = false }) {
@@ -2018,6 +2250,24 @@ function countOpenTrades(execState) {
     else if (t.status === 'settled') summary.settled += 1;
   }
   return summary;
+}
+
+function summarizeResolvedTrades(execState) {
+  const rows = Array.isArray(execState?.resolvedTrades) ? execState.resolvedTrades : [];
+  const last = rows.length ? rows[rows.length - 1] : null;
+  return {
+    count: rows.length,
+    last: last
+      ? {
+        bucketKey: Number.isFinite(Number(last.bucketKey)) ? Number(last.bucketKey) : null,
+        conditionId: String(last.conditionId || ''),
+        marketSlug: String(last.marketSlug || ''),
+        result: String(last.result || ''),
+        outcomeWinner: String(last.outcomeWinner || ''),
+        resolvedAtMs: Number.isFinite(Number(last.resolvedAtMs)) ? Number(last.resolvedAtMs) : null,
+      }
+      : null,
+  };
 }
 
 function oppositeSide(side) {
@@ -2242,8 +2492,25 @@ async function runExecute(body, requestRid) {
   const market = await resolveUpDownMarket(req.marketSlug, nowMs);
   const tokenId = decision === 'UP' ? market.yesTokenId : decision === 'DOWN' ? market.noTokenId : null;
   let execState = normalizeExecState(await loadExecuteState(req.env, market));
-  const reconcile = await reconcileExecuteState(execState, bucketKey);
+  const reconcile = await reconcileExecuteState(execState, bucketKey, { allowFixture: req.mode !== 'live' });
   execState = normalizeExecState(reconcile.state);
+  const reconcileAttempted = Boolean(reconcile?.reconcileAttempted);
+  const reconcileResult = reconcile?.reconcileResult && typeof reconcile.reconcileResult === 'object'
+    ? reconcile.reconcileResult
+    : {
+      status: 'no_pending',
+      pendingBucketKey: null,
+      conditionId: null,
+      marketSlug: null,
+      winner: null,
+      result: null,
+      stepBefore: null,
+      stepAfter: null,
+      lossStreakBefore: null,
+      lossStreakAfter: null,
+      upstreamStatus: null,
+      upstreamMessage: null,
+    };
   const unresolvedTradesBefore = (Array.isArray(execState.openTrades) ? execState.openTrades : []).filter((t) => t.status === 'open');
   const pendingUnresolvedCountBefore = unresolvedTradesBefore.length;
   const hasPendingUnresolved = pendingUnresolvedCountBefore > 0;
@@ -2277,8 +2544,12 @@ async function runExecute(body, requestRid) {
     computedNotionalUSD: sizing.computedNotionalUSD,
     step: Math.max(0, Number(execState.step ?? sizing.step)),
     lossStreak: Math.max(0, safeNum(execState.lossStreak, 0)),
+    lastResolvedBucketKey: Number.isFinite(Number(execState.lastResolvedBucketKey)) ? Number(execState.lastResolvedBucketKey) : null,
     pendingUnresolvedCount: (Array.isArray(execState.openTrades) ? execState.openTrades : []).filter((t) => t.status === 'open').length,
     openTradesSummary: summarizeOpenTrades(execState),
+    resolvedTradesSummary: summarizeResolvedTrades(execState),
+    reconcileAttempted,
+    reconcileResult,
     exitAttempted,
     exitEligibleCount,
     exitResult,
@@ -2311,6 +2582,10 @@ async function runExecute(body, requestRid) {
       computedNotionalUSD: resp?.computedNotionalUSD,
       openTradesCount: Array.isArray(resp?.openTradesSummary) ? resp.openTradesSummary.filter((x) => x.status === 'open').length : null,
       exitAttempted: Boolean(resp?.exitAttempted),
+      reconcileStatus: resp?.reconcileResult?.status || 'no_pending',
+      reconcileResult: resp?.reconcileResult?.result || '-',
+      pendingBucketKey: Number.isFinite(Number(resp?.reconcileResult?.pendingBucketKey)) ? Number(resp.reconcileResult.pendingBucketKey) : '-',
+      lastResolvedBucketKey: Number.isFinite(Number(resp?.lastResolvedBucketKey)) ? Number(resp.lastResolvedBucketKey) : '-',
       orderType: resp?.orderType ?? null,
       attemptCount: Number.isFinite(resp?.attemptCount) ? resp.attemptCount : null,
       upstreamStatus: resp?.upstreamStatus ?? null,
@@ -2570,6 +2845,8 @@ async function runExecute(body, requestRid) {
 
   const upstreamStatus = order.skipped ? (order.upstreamStatus ?? null) : null;
   const upstreamMessage = order.skipped ? (order.upstreamMessage ?? null) : null;
+  const reconcileUpstreamStatus = reconcileResult?.status === 'unavailable' ? (reconcileResult.upstreamStatus ?? null) : null;
+  const reconcileUpstreamMessage = reconcileResult?.status === 'unavailable' ? (reconcileResult.upstreamMessage ?? null) : null;
   const feeRateBpsUsed = Number.isInteger(order?.feeRateBpsUsed) ? order.feeRateBpsUsed : null;
   const feeSource = typeof order?.feeSource === 'string' ? order.feeSource : null;
   const feeRaw = order?.feeRaw ?? null;
@@ -2613,7 +2890,11 @@ async function runExecute(body, requestRid) {
   const resp = {
     ...mkBase(),
     deduped: false,
-    reason: tradeExecuted && hasPendingUnresolved ? 'pending_unresolved_base_stake' : reason,
+    reason: (() => {
+      if (tradeExecuted && hasPendingUnresolved) return 'pending_unresolved_base_stake';
+      if (reason === 'trade_executed' && reconcileResult?.status === 'unavailable') return 'reconcile_unavailable';
+      return reason;
+    })(),
     feeRateBpsUsed,
     feeSource,
     feeRaw,
@@ -2630,8 +2911,8 @@ async function runExecute(body, requestRid) {
       takerFinal: precisionApplied?.takerFinal ?? takerAmountFinal ?? null,
     },
     voteSummary: quorum.voteSummary,
-    ...(upstreamStatus ? { upstreamStatus } : {}),
-    ...(upstreamMessage ? { upstreamMessage } : {}),
+    ...((upstreamStatus ?? reconcileUpstreamStatus) ? { upstreamStatus: upstreamStatus ?? reconcileUpstreamStatus } : {}),
+    ...((upstreamMessage || reconcileUpstreamMessage) ? { upstreamMessage: upstreamMessage || reconcileUpstreamMessage } : {}),
     ...(orderStatus ? { orderStatus } : {}),
     ...(orderId ? { orderId } : {}),
     ...(order?.skipped ? { filled: false } : { filled }),
@@ -2677,6 +2958,47 @@ app.get('/status', (_req, res) => {
     },
     lastRun: state.lastRun,
   });
+});
+
+app.post('/debug/exec-state', async (req, res) => {
+  try {
+    if (!ENV.POLY_DEBUG_STATE) {
+      res.status(403).json({ ok: false, error: 'debug_state_disabled' });
+      return;
+    }
+    const envName = String(req.body?.env || 'mainnet').trim() || 'mainnet';
+    const slug = String(req.body?.marketSlug || ENV.POLY_MARKET_SLUG || '').trim();
+    if (!slug) {
+      res.status(400).json({ ok: false, error: 'marketSlug_required' });
+      return;
+    }
+    const market = await resolveUpDownMarket(slug, Date.now());
+    const current = normalizeExecState(await loadExecuteState(envName, market));
+    const patch = req.body?.state && typeof req.body.state === 'object' ? req.body.state : {};
+    const next = normalizeExecState({
+      ...current,
+      ...patch,
+      _docId: current._docId,
+    });
+    await saveExecuteState(next);
+    res.status(200).json({
+      ok: true,
+      env: envName,
+      marketSlug: market.slug,
+      state: {
+        step: next.step,
+        lossStreak: next.lossStreak,
+        cumulativeLossUSD: next.cumulativeLossUSD,
+        pausedUntilBucket: next.pausedUntilBucket,
+        lastResolvedBucketKey: next.lastResolvedBucketKey,
+        openTradesSummary: summarizeOpenTrades(next),
+        resolvedTradesSummary: summarizeResolvedTrades(next),
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ ok: false, error: `debug_state_error:${message.slice(0, 140)}` });
+  }
 });
 
 async function handleDecisionRoute(req, res, forceExecute = false) {
