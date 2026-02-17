@@ -12,6 +12,8 @@
     "poly:dev": "npm --workspace services/polymarket-bot run dev",
     "poly:tick": "npm --workspace services/polymarket-bot run tick",
     "poly:test": "npm --workspace services/polymarket-bot run poly:test",
-    "poly:smoke": "./scripts/poly_smoke.sh"
+    "poly:smoke": "./scripts/poly_smoke.sh",
+    "poly:deploy": "./scripts/poly_deploy.sh",
+    "poly:cloud-smoke": "./scripts/poly_cloud_smoke.sh"
   }
 }

@@ -64,6 +64,11 @@ If `marketSlug` is not provided, bot auto-selects tradable market from:
 PORT=19082 POLY_DRY_RUN=true POLY_TV_SECRET='tv_xxx' npm run poly:dev
 ```
 
+## Cloud Run Deploy (DRY_RUN default)
+```bash
+POLY_GCP_PROJECT='your-project-id' POLY_GCP_REGION='europe-west1' POLY_SERVICE='polymarket-bot' POLY_TV_SECRET='tv_xxx' npm run poly:deploy
+```
+
 ## Find Active BTC Up/Down 5m Market
 ```bash
 python3 scripts/find_active_btc_updown_5m.py
@@ -83,4 +88,10 @@ npm run poly:test
 Service acikken (`PORT=19082`):
 ```bash
 POLY_TV_SECRET='tv_xxx' npm run poly:smoke
+```
+
+## Cloud Smoke
+Cloud Run URL ile:
+```bash
+POLY_TV_SECRET='tv_xxx' npm run poly:cloud-smoke -- https://your-service-url
 ```

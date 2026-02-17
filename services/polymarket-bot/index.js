@@ -907,7 +907,7 @@ app.use((err, _req, res, _next) => {
 
 async function bootstrap() {
   await loadStateFromDisk();
-  app.listen(ENV.PORT, () => {
+  app.listen(ENV.PORT, '0.0.0.0', () => {
     console.log(JSON.stringify({ ts: new Date().toISOString(), service: 'polymarket-bot', msg: 'listening', port: ENV.PORT, dryRun: ENV.POLY_DRY_RUN, killSwitch: ENV.POLY_KILL_SWITCH, slug: ENV.POLY_MARKET_SLUG || null }));
   });
 }
