@@ -511,7 +511,10 @@ async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrder
   const client = new ClobClient(ENV.POLY_CLOB_HOST, 137, signer, undefined, undefined, ENV.POLY_FUNDER_ADDRESS || undefined);
   const maybeCreate = client.createApiKey || client.createOrDeriveApiKey;
   if (typeof maybeCreate === 'function') {
-    await maybeCreate.call(client);
+    const creds = await maybeCreate.call(client);
+    if (creds && typeof creds === 'object' && creds.key && creds.secret && creds.passphrase) {
+      client.creds = creds;
+    }
   }
 
   const orderPayload = {
@@ -578,7 +581,12 @@ async function placeOutcomeOrder({ outcome, tokenId, notionalUSD, clientOrderId,
   const signer = new Wallet(ENV.POLY_PRIVATE_KEY);
   const client = new ClobClient(ENV.POLY_CLOB_HOST, 137, signer, undefined, undefined, ENV.POLY_FUNDER_ADDRESS || undefined);
   const maybeCreate = client.createApiKey || client.createOrDeriveApiKey;
-  if (typeof maybeCreate === 'function') await maybeCreate.call(client);
+  if (typeof maybeCreate === 'function') {
+    const creds = await maybeCreate.call(client);
+    if (creds && typeof creds === 'object' && creds.key && creds.secret && creds.passphrase) {
+      client.creds = creds;
+    }
+  }
 
   const orderPayload = {
     tokenID: tokenId,
