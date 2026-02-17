@@ -3,5 +3,4 @@ npm-debug.log*
 .state.json
 *.log
 *.test.mjs
-lib/
 README.md
