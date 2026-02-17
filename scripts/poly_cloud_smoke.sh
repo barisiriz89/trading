@@ -82,13 +82,13 @@ python3 - "$SECOND_FILE" <<'PY'
 import json,sys
 with open(sys.argv[1],"r",encoding="utf-8") as f:
     j=json.load(f)
-required=["rid","decision","mode","dryRun","tradeExecuted","deduped","reason","bucketKey","step","lossStreak","computedNotionalUSD","marketSlug","openTradesSummary","pendingUnresolvedCount","exitAttempted","exitResult"]
+required=["rid","decision","mode","dryRun","tradeExecuted","deduped","reason","bucketKey","step","lossStreak","computedNotionalUSD","marketSlug","openTradesSummary","pendingTradesSummary","pendingUnresolvedCount","lastResolvedBucketKey","reconcileAttempted","reconcileResult","resolvedTradesSummary"]
 for key in required:
     if key not in j:
         raise SystemExit(f"FAIL: response field eksik: {key}")
 if j.get("deduped") is True and j.get("reason") == "already_filled_this_bucket":
     raise SystemExit(0)
-if j.get("reason") not in {"mode_test","dry_run_gate","reconcile_unavailable","below_min_size","cooldown_active","max_trades_per_hour","max_position_usd","no_quorum","pending_unresolved_base_stake","exit_executed_profit","exit_not_filled","open_trades_cap_reached","paused"}:
+if j.get("reason") not in {"mode_test","dry_run_gate","reconcile_unavailable","below_min_size","cooldown_active","max_trades_per_hour","max_position_usd","no_quorum","pending_unresolved_base_stake","open_trades_cap_reached","paused"}:
     raise SystemExit("FAIL: second call dedupe veya deterministic blocker reason bekleniyordu")
 PY
 

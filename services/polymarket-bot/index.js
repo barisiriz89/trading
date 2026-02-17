@@ -1361,6 +1361,13 @@ async function placeOutcomeOrder({
   fallbackTakerBaseFee,
 }) {
   const orderSide = String(side || 'BUY').toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
+  if (orderSide === 'SELL') {
+    return {
+      skipped: true,
+      reason: 'sell_disabled_hold_to_settlement',
+      intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+    };
+  }
   if (mode === 'test') {
     return {
       skipped: true,
@@ -2243,10 +2250,9 @@ function summarizeOpenTrades(execState) {
 
 function countOpenTrades(execState) {
   const openTrades = Array.isArray(execState?.openTrades) ? execState.openTrades : [];
-  const summary = { open: 0, closed_exit: 0, settled: 0, total: openTrades.length };
+  const summary = { open: 0, settled: 0, total: openTrades.length };
   for (const t of openTrades) {
     if (t.status === 'open') summary.open += 1;
-    else if (t.status === 'closed_exit') summary.closed_exit += 1;
     else if (t.status === 'settled') summary.settled += 1;
   }
   return summary;
@@ -2270,49 +2276,11 @@ function summarizeResolvedTrades(execState) {
   };
 }
 
-function oppositeSide(side) {
-  return String(side || '').toUpperCase() === 'UP' ? 'DOWN' : 'UP';
-}
-
-async function fetchBestBid(tokenId) {
-  try {
-    const url = `${ENV.POLY_CLOB_HOST}/book?token_id=${encodeURIComponent(String(tokenId || ''))}`;
-    const payload = await fetchJson(url);
-    const bids = Array.isArray(payload?.bids) ? payload.bids : [];
-    if (!bids.length) return null;
-    const best = bids[0];
-    const p = Number(best?.price ?? best?.p ?? best?.rate);
-    return Number.isFinite(p) ? p : null;
-  } catch {
-    return null;
-  }
-}
-
-async function fetchBestAsk(tokenId) {
-  try {
-    const url = `${ENV.POLY_CLOB_HOST}/book?token_id=${encodeURIComponent(String(tokenId || ''))}`;
-    const payload = await fetchJson(url);
-    const asks = Array.isArray(payload?.asks) ? payload.asks : [];
-    if (!asks.length) return null;
-    const best = asks[0];
-    const p = Number(best?.price ?? best?.p ?? best?.rate);
-    return Number.isFinite(p) ? p : null;
-  } catch {
-    return null;
-  }
-}
-
-function exitPolicySnapshot(marketOrderMinSize) {
+function summarizePendingTrades(execState) {
+  const rows = summarizeOpenTrades(execState).filter((x) => x.status === 'open');
   return {
-    minNetProfitUSD: Number(ENV.POLY_EXIT_MIN_NET_PROFIT_USD),
-    maxExitAttemptsPerExecute: Math.max(1, Number(ENV.POLY_EXIT_MAX_ATTEMPTS_PER_EXECUTE) || 1),
-    useBidForYesSell: true,
-    useAskForNoSell: false,
-    slippageBps: Number(ENV.POLY_EXIT_SLIPPAGE_BPS || 0),
-    minOrderSizeUSD: Math.max(
-      Number(ENV.POLY_EXIT_MIN_ORDER_USD || 5),
-      Number.isFinite(Number(marketOrderMinSize)) ? Number(marketOrderMinSize) : 0,
-    ),
+    count: rows.length,
+    trades: rows,
   };
 }
 
@@ -2520,10 +2488,6 @@ async function runExecute(body, requestRid) {
     marketOrderMinSize: market.orderMinSize,
     forceBaseStake: hasPendingUnresolved,
   });
-  const exitPolicy = exitPolicySnapshot(market.orderMinSize);
-  let exitAttempted = false;
-  let exitEligibleCount = 0;
-  let exitResult = null;
   const mkBase = () => ({
     ok: true,
     rid: requestRid,
@@ -2546,14 +2510,11 @@ async function runExecute(body, requestRid) {
     lossStreak: Math.max(0, safeNum(execState.lossStreak, 0)),
     lastResolvedBucketKey: Number.isFinite(Number(execState.lastResolvedBucketKey)) ? Number(execState.lastResolvedBucketKey) : null,
     pendingUnresolvedCount: (Array.isArray(execState.openTrades) ? execState.openTrades : []).filter((t) => t.status === 'open').length,
+    pendingTradesSummary: summarizePendingTrades(execState),
     openTradesSummary: summarizeOpenTrades(execState),
     resolvedTradesSummary: summarizeResolvedTrades(execState),
     reconcileAttempted,
     reconcileResult,
-    exitAttempted,
-    exitEligibleCount,
-    exitResult,
-    exitPolicy,
     sizing: {
       auto: false,
       step: sizing.step,
@@ -2581,7 +2542,6 @@ async function runExecute(body, requestRid) {
       lossStreak: resp?.lossStreak,
       computedNotionalUSD: resp?.computedNotionalUSD,
       openTradesCount: Array.isArray(resp?.openTradesSummary) ? resp.openTradesSummary.filter((x) => x.status === 'open').length : null,
-      exitAttempted: Boolean(resp?.exitAttempted),
       reconcileStatus: resp?.reconcileResult?.status || 'no_pending',
       reconcileResult: resp?.reconcileResult?.result || '-',
       pendingBucketKey: Number.isFinite(Number(resp?.reconcileResult?.pendingBucketKey)) ? Number(resp.reconcileResult.pendingBucketKey) : '-',
@@ -2721,128 +2681,6 @@ async function runExecute(body, requestRid) {
     state.lastDirection = decision;
   }
 
-  if (ENV.POLY_EXIT_ENABLED) {
-    const openTrades = (Array.isArray(execState.openTrades) ? execState.openTrades : []).filter((t) => t.status === 'open');
-    let exitAttempts = 0;
-    for (const trade of openTrades) {
-      if (exitAttempts >= Math.max(1, Number(ENV.POLY_EXIT_MAX_ATTEMPTS_PER_EXECUTE) || 1)) break;
-      const tBucket = Number(trade.bucketKey);
-      if (!Number.isFinite(tBucket)) continue;
-      if (bucketKey < (tBucket + Math.max(0, Number(ENV.POLY_EXIT_ONLY_AFTER_BUCKETS) || 1))) continue;
-
-      const attemptedBuckets = Array.isArray(trade?.exit?.attemptedBuckets) ? trade.exit.attemptedBuckets.map((x) => Number(x)) : [];
-      if (attemptedBuckets.includes(bucketKey)) continue;
-
-      const bestBid = await fetchBestBid(trade.tokenId);
-      const bestAsk = await fetchBestAsk(trade.tokenId);
-      const entryPrice = Number.isFinite(Number(trade.priceEntry)) ? Number(trade.priceEntry) : null;
-      const markPriceUsedRaw = Number.isFinite(Number(bestBid)) ? Number(bestBid) : null;
-      const markPriceUsed = Number.isFinite(markPriceUsedRaw)
-        ? Number((markPriceUsedRaw * (1 - (Number(ENV.POLY_EXIT_SLIPPAGE_BPS || 0) / 10000))).toFixed(6))
-        : null;
-      const size = Number.isFinite(Number(trade.sizeEntry))
-        ? Number(trade.sizeEntry)
-        : (entryPrice && entryPrice > 0 ? Number(trade.notionalUSD) / entryPrice : null);
-      if (!Number.isFinite(size) || !Number.isFinite(markPriceUsed) || markPriceUsed <= 0) {
-        exitResult = {
-          tradeId: `${trade.bucketKey}:${trade.tokenId}:${trade.side}`,
-          attempted: false,
-          executed: false,
-          reason: 'exit_no_liquidity',
-          bestBid,
-          bestAsk,
-          entryPrice,
-          markPriceUsed,
-          estGrossPnL: null,
-          estNetPnL: null,
-          feeRateBpsUsed: null,
-          orderType: String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
-          attemptCount: 0,
-          upstreamStatus: null,
-          upstreamMessage: null,
-        };
-        continue;
-      }
-      const feeBps = Number.isFinite(Number(market.takerBaseFee)) ? Number(market.takerBaseFee) : 0;
-      const estGross = (markPriceUsed - (entryPrice || markPriceUsed)) * size;
-      const estFees = ((trade.notionalUSD || 0) * feeBps / 10000) + ((size * markPriceUsed) * feeBps / 10000);
-      let estNet = estGross - estFees;
-      if (ENV.POLY_EXIT_FORCE) estNet = Number(ENV.POLY_EXIT_FORCE_NET_PROFIT_USD || 0.1);
-      if (estNet < Number(ENV.POLY_EXIT_MIN_NET_PROFIT_USD || 0.05)) {
-        exitResult = {
-          tradeId: `${trade.bucketKey}:${trade.tokenId}:${trade.side}`,
-          attempted: false,
-          executed: false,
-          reason: 'exit_not_profitable',
-          bestBid,
-          bestAsk,
-          entryPrice,
-          markPriceUsed,
-          estGrossPnL: Number(estGross.toFixed(6)),
-          estNetPnL: Number(estNet.toFixed(6)),
-          feeRateBpsUsed: feeBps,
-          orderType: String(ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
-          attemptCount: 0,
-          upstreamStatus: null,
-          upstreamMessage: null,
-        };
-        continue;
-      }
-
-      exitEligibleCount += 1;
-      exitAttempted = true;
-      exitAttempts += 1;
-      const exitNotional = Math.max(Number(ENV.POLY_EXIT_MIN_ORDER_USD || 5), Math.min(Number(trade.notionalUSD || 0), Number(trade.notionalUSD || 0)));
-      const exitOrder = await placeOutcomeOrder({
-        outcome: String(trade.side || '').toUpperCase() === 'UP' ? 'Up' : 'Down',
-        tokenId: trade.tokenId,
-        side: 'SELL',
-        notionalUSD: exitNotional,
-        clientOrderId: `${req.clientOrderId}:exit:${trade.bucketKey}`,
-        mode: req.mode,
-        dryRun: requestDryRun,
-        midPrice: markPriceUsed,
-        runRid: requestRid,
-        decision: String(trade.side || '').toUpperCase(),
-        bucketKey,
-        conditionId: trade.conditionId || market.conditionId,
-        fallbackTakerBaseFee: market.takerBaseFee,
-      });
-      trade.exit = {
-        attemptedBuckets: [...attemptedBuckets, bucketKey],
-        closedAtMs: exitOrder.skipped ? null : nowMs,
-        reason: exitOrder.skipped ? String(exitOrder.reason || 'exit_unfilled') : 'exit_executed_profit',
-        price: exitOrder?.priceFinal ?? markPriceUsed,
-        size: exitOrder?.sizeFinal ?? size,
-      };
-      if (!exitOrder.skipped) {
-        trade.status = 'closed_exit';
-        execState.step = 0;
-        execState.lossStreak = 0;
-        execState.cumulativeLossUSD = 0;
-      }
-      exitResult = {
-        tradeId: `${trade.bucketKey}:${trade.tokenId}:${trade.side}`,
-        attempted: true,
-        executed: !exitOrder.skipped,
-        reason: exitOrder.skipped ? 'exit_unfilled' : 'exit_executed_profit',
-        bestBid,
-        bestAsk,
-        entryPrice,
-        markPriceUsed,
-        estGrossPnL: Number(estGross.toFixed(6)),
-        estNetPnL: Number(estNet.toFixed(6)),
-        feeRateBpsUsed: Number.isInteger(exitOrder?.feeRateBpsUsed) ? exitOrder.feeRateBpsUsed : feeBps,
-        orderType: String(exitOrder?.orderType || ENV.POLY_ORDER_TYPE || 'FOK').toUpperCase(),
-        attemptCount: Number(exitOrder?.attemptCount || 1),
-        upstreamStatus: exitOrder?.upstreamStatus ?? null,
-        upstreamMessage: exitOrder?.upstreamMessage ?? null,
-      };
-      if (!exitOrder.skipped && reason === 'trade_executed') reason = 'exit_executed_profit';
-      break;
-    }
-  }
-
   const upstreamStatus = order.skipped ? (order.upstreamStatus ?? null) : null;
   const upstreamMessage = order.skipped ? (order.upstreamMessage ?? null) : null;
   const reconcileUpstreamStatus = reconcileResult?.status === 'unavailable' ? (reconcileResult.upstreamStatus ?? null) : null;
@@ -2923,10 +2761,8 @@ async function runExecute(body, requestRid) {
     ...(!order.skipped ? { order } : {}),
     tradeExecuted,
     pendingUnresolvedCount: (Array.isArray(execState.openTrades) ? execState.openTrades : []).filter((t) => t.status === 'open').length,
+    pendingTradesSummary: summarizePendingTrades(execState),
     openTradesSummary: summarizeOpenTrades(execState),
-    exitAttempted,
-    exitEligibleCount,
-    exitResult,
   };
   state.lastRun = resp;
   await saveStateToDisk().catch(() => {});

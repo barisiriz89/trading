@@ -40,7 +40,7 @@ python3 - "$RESP" <<'PY'
 import json,sys
 with open(sys.argv[1],"r",encoding="utf-8") as f:
     j=json.load(f)
-required=["rid","decision","mode","dryRun","tradeExecuted","deduped","reason","bucketKey","step","lossStreak","computedNotionalUSD","marketSlug","openTradesSummary","pendingUnresolvedCount","exitAttempted","exitResult"]
+required=["rid","decision","mode","dryRun","tradeExecuted","deduped","reason","bucketKey","step","lossStreak","computedNotionalUSD","marketSlug","openTradesSummary","pendingTradesSummary","pendingUnresolvedCount","lastResolvedBucketKey","reconcileAttempted","reconcileResult","resolvedTradesSummary"]
 for key in required:
     if key not in j:
         raise SystemExit(f"FAIL: response field eksik: {key}")
