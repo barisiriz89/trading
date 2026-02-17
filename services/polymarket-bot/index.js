@@ -66,6 +66,9 @@ const ENV = {
   POLY_EXIT_FORCE: String(process.env.POLY_EXIT_FORCE || 'false').toLowerCase() === 'true',
   POLY_EXIT_FORCE_NET_PROFIT_USD: Number(process.env.POLY_EXIT_FORCE_NET_PROFIT_USD || 0.1),
   POLY_MAX_OPEN_TRADES: Number(process.env.POLY_MAX_OPEN_TRADES || 6),
+  POLY_MAKER_DECIMALS: Number(process.env.POLY_MAKER_DECIMALS || 2),
+  POLY_TAKER_DECIMALS: Number(process.env.POLY_TAKER_DECIMALS || 4),
+  POLY_API_CREDS_TTL_MS: Number(process.env.POLY_API_CREDS_TTL_MS || (55 * 60 * 1000)),
   POLY_STATE_COLLECTION: String(process.env.POLY_STATE_COLLECTION || 'polymarketBotState').trim(),
 };
 
@@ -97,6 +100,13 @@ const state = {
 const marketCache = {
   bySlug: new Map(),
   latestAuto: null,
+};
+
+const apiCredsCache = {
+  creds: null,
+  createdAtMs: 0,
+  expiresAtMs: 0,
+  inFlightPromise: null,
 };
 
 let firestoreClientPromise = null;
@@ -705,9 +715,33 @@ function normalizeUsdAmount(amount) {
   return Number((Math.max(0.01, n)).toFixed(2));
 }
 
-function floorToDecimals(value, decimals) {
-  const dec = Math.max(0, Number(decimals) || 0);
+function toPlainDecimalString(value) {
   const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  if (/^[+-]?\d+(\.\d+)?$/.test(raw)) return raw;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return '';
+  const s = String(n);
+  if (!/[eE]/.test(s)) return s;
+  const neg = s.startsWith('-');
+  const normalized = s.replace(/^[+-]/, '');
+  const [coeff, expPart] = normalized.split(/[eE]/);
+  const exp = Number(expPart);
+  if (!Number.isInteger(exp)) return '';
+  const [i, f = ''] = coeff.split('.');
+  const digits = `${i}${f}`;
+  const dotIndex = i.length;
+  const newDot = dotIndex + exp;
+  let out;
+  if (newDot <= 0) out = `0.${'0'.repeat(Math.abs(newDot))}${digits}`;
+  else if (newDot >= digits.length) out = `${digits}${'0'.repeat(newDot - digits.length)}`;
+  else out = `${digits.slice(0, newDot)}.${digits.slice(newDot)}`;
+  return neg ? `-${out}` : out;
+}
+
+function floorDecimalString(value, decimals) {
+  const dec = Math.max(0, Number(decimals) || 0);
+  const raw = toPlainDecimalString(value);
   if (!raw) return '0';
   const neg = raw.startsWith('-');
   const normalized = raw.replace(/^[+-]/, '');
@@ -722,11 +756,15 @@ function floorToDecimals(value, decimals) {
   return out;
 }
 
-function applyMakerTakerPrecision(orderRequest) {
+function floorToDecimals(value, decimals) {
+  return floorDecimalString(value, decimals);
+}
+
+function applyMakerTakerPrecision(orderRequest, makerDecimals = ENV.POLY_MAKER_DECIMALS, takerDecimals = ENV.POLY_TAKER_DECIMALS) {
   const makerWas = orderRequest?.makerAmount ?? null;
   const takerWas = orderRequest?.takerAmount ?? orderRequest?.amount ?? null;
-  const makerAmount = floorToDecimals(makerWas ?? 0, 4);
-  const takerAmount = floorToDecimals(takerWas ?? 0, 2);
+  const makerAmount = floorToDecimals(makerWas ?? 0, makerDecimals);
+  const takerAmount = floorToDecimals(takerWas ?? 0, takerDecimals);
   const next = {
     ...orderRequest,
     makerAmount,
@@ -736,19 +774,25 @@ function applyMakerTakerPrecision(orderRequest) {
   return {
     orderRequest: next,
     precisionApplied: {
-      makerDecimals: 4,
-      takerDecimals: 2,
+      makerDecimals,
+      takerDecimals,
       makerWas,
       takerWas,
+      makerFinal: makerAmount,
+      takerFinal: takerAmount,
     },
   };
 }
 
 function countDecimals(value) {
-  const s = String(value ?? '').trim();
+  const s = toPlainDecimalString(value);
   const m = s.match(/^-?\d+(?:\.(\d+))?$/);
   if (!m) return 0;
   return m[1] ? m[1].length : 0;
+}
+
+function assertDecimals(valueString, maxDecimals) {
+  return countDecimals(valueString) <= Math.max(0, Number(maxDecimals) || 0);
 }
 
 function isPositiveNumberLike(value) {
@@ -843,8 +887,10 @@ function sanitizeOrderRequest(orderRequest) {
 }
 
 async function postMarketOrderWithClient(client, mod, orderRequest, orderTypeName = ENV.POLY_ORDER_TYPE) {
+  const makerDecimals = Math.max(0, Number(ENV.POLY_MAKER_DECIMALS) || 2);
+  const takerDecimals = Math.max(0, Number(ENV.POLY_TAKER_DECIMALS) || 4);
   const orderType = resolveOrderType(mod, orderTypeName);
-  const { orderRequest: quantizedReq, precisionApplied } = applyMakerTakerPrecision(orderRequest);
+  const { orderRequest: quantizedReq, precisionApplied } = applyMakerTakerPrecision(orderRequest, makerDecimals, takerDecimals);
   const tickSize = typeof client.getTickSize === 'function'
     ? await client.getTickSize(quantizedReq.tokenID).catch(() => undefined)
     : undefined;
@@ -855,110 +901,179 @@ async function postMarketOrderWithClient(client, mod, orderRequest, orderTypeNam
   }
 
   const priceDecimals = Math.max(2, tickDecimalsFromValue(tickSize));
-  const takerAmountFinal = floorToDecimals(quantizedReq.amount ?? 0, 2);
   const priceFinal = floorToDecimals(quantizedReq.price ?? 0.5, priceDecimals);
-  const sizeRaw = Number(takerAmountFinal) / Number(priceFinal || '0');
-  const sizeFinal = floorToDecimals(sizeRaw, 4);
+  const makerAmountFinal = floorToDecimals(quantizedReq.amount ?? 0, makerDecimals);
+  const takerAmountFinal = floorToDecimals(Number(makerAmountFinal) / Number(priceFinal || '0'), takerDecimals);
+  const sizeRaw = Number(takerAmountFinal);
+  const sizeFinal = takerAmountFinal;
   const feeRateBpsValue = Number.isInteger(quantizedReq.feeRateBps) ? quantizedReq.feeRateBps : undefined;
 
-  const userOrder = {
-    tokenID: String(quantizedReq.tokenID || ''),
-    side: quantizedReq.side,
-    price: Number(priceFinal),
-    size: Number(sizeFinal),
-    ...(Number.isInteger(feeRateBpsValue) ? { feeRateBps: feeRateBpsValue } : {}),
-  };
-
   const precisionDetail = {
-    makerDecimals: 4,
-    takerDecimals: 2,
+    makerDecimals,
+    takerDecimals,
     makerWas: quantizedReq.makerAmount ?? null,
     takerWas: quantizedReq.takerAmount ?? quantizedReq.amount ?? null,
+    makerFinal: makerAmountFinal,
+    takerFinal: takerAmountFinal,
     priceWas: quantizedReq.price ?? null,
     sizeWas: sizeRaw,
   };
 
-  if (!isPositiveNumberLike(userOrder.price) || !isPositiveNumberLike(userOrder.size) || !isPositiveNumberLike(takerAmountFinal)) {
+  if (
+    !isPositiveNumberLike(priceFinal)
+    || !isPositiveNumberLike(makerAmountFinal)
+    || !isPositiveNumberLike(takerAmountFinal)
+    || !assertDecimals(makerAmountFinal, makerDecimals)
+    || !assertDecimals(takerAmountFinal, takerDecimals)
+  ) {
     return {
       preflightFailed: true,
       reason: 'amount_precision_preflight_failed',
+      upstreamMessage: 'preflight: maker/taker decimal cap violated or zero after floor',
       precisionApplied: precisionDetail,
       finalOrderRequest: {
         ...quantizedReq,
         price: Number(priceFinal),
         size: Number(sizeFinal),
-        amount: Number(takerAmountFinal),
+        amount: Number(makerAmountFinal),
+        makerAmount: makerAmountFinal,
         takerAmount: takerAmountFinal,
       },
       clobPayloadPosted: {
-        tokenId: userOrder.tokenID,
-        side: String(userOrder.side || ''),
+        tokenId: String(quantizedReq.tokenID || ''),
+        side: String(quantizedReq.side || ''),
         price: priceFinal,
         size: sizeFinal,
-        makerAmount: null,
+        makerAmount: makerAmountFinal,
         takerAmount: takerAmountFinal,
         orderType: String(orderType || ''),
       },
     };
   }
 
-  const signedOrder = await createOrder.call(client, userOrder, tickSize);
-  const makerAmountFinal = floorToDecimals(signedOrder?.makerAmount, 4);
-  const takerAmountSignedFinal = floorToDecimals(signedOrder?.takerAmount, 2);
-  const makerOk = countDecimals(makerAmountFinal) <= 4 && isPositiveNumberLike(makerAmountFinal);
-  const takerOk = countDecimals(takerAmountSignedFinal) <= 2 && isPositiveNumberLike(takerAmountSignedFinal);
-  if (!makerOk || !takerOk) {
-    return {
-      preflightFailed: true,
-      reason: 'amount_precision_preflight_failed',
-      precisionApplied: precisionDetail,
-      finalOrderRequest: {
-        ...quantizedReq,
-        price: Number(priceFinal),
-        size: Number(sizeFinal),
-        amount: Number(takerAmountFinal),
-        makerAmount: makerAmountFinal,
-        takerAmount: takerAmountSignedFinal,
-      },
-      clobPayloadPosted: {
-        tokenId: String(signedOrder?.tokenId || userOrder.tokenID),
-        side: String(signedOrder?.side || userOrder.side || ''),
-        price: priceFinal,
-        size: sizeFinal,
-        makerAmount: makerAmountFinal,
-        takerAmount: takerAmountSignedFinal,
-        orderType: String(orderType || ''),
-      },
+  const sideUpper = String(quantizedReq.side || '').toUpperCase();
+  let signedOrder;
+  if (sideUpper === 'BUY' && typeof client.createMarketBuyOrder === 'function') {
+    const userMarketOrder = {
+      tokenID: String(quantizedReq.tokenID || ''),
+      amount: Number(makerAmountFinal),
+      price: Number(priceFinal),
+      ...(Number.isInteger(feeRateBpsValue) ? { feeRateBps: feeRateBpsValue } : {}),
     };
+    signedOrder = await client.createMarketBuyOrder(userMarketOrder, tickSize);
+  } else {
+    const userOrder = {
+      tokenID: String(quantizedReq.tokenID || ''),
+      side: quantizedReq.side,
+      price: Number(priceFinal),
+      size: Number(sizeFinal),
+      ...(Number.isInteger(feeRateBpsValue) ? { feeRateBps: feeRateBpsValue } : {}),
+    };
+    signedOrder = await createOrder.call(client, userOrder, tickSize);
   }
 
   const result = await postOrder.call(client, signedOrder, orderType);
   return {
     result,
     orderType,
-    precisionApplied: precisionDetail,
+    precisionApplied: {
+      ...precisionDetail,
+      makerFinal: makerAmountFinal,
+      takerFinal: takerAmountFinal,
+    },
     finalOrderRequest: {
       ...quantizedReq,
       price: Number(priceFinal),
       size: Number(sizeFinal),
-      amount: Number(takerAmountFinal),
+      amount: Number(makerAmountFinal),
       makerAmount: makerAmountFinal,
-      takerAmount: takerAmountSignedFinal,
+      takerAmount: takerAmountFinal,
     },
     makerAmountFinal,
-    takerAmountFinal: takerAmountSignedFinal,
+    takerAmountFinal,
     priceFinal,
     sizeFinal,
     clobPayloadPosted: {
-      tokenId: String(signedOrder?.tokenId || userOrder.tokenID),
-      side: String(signedOrder?.side || userOrder.side || ''),
+      tokenId: String(signedOrder?.tokenId || quantizedReq.tokenID || ''),
+      side: String(signedOrder?.side || quantizedReq.side || ''),
       price: priceFinal,
       size: sizeFinal,
       makerAmount: makerAmountFinal,
-      takerAmount: takerAmountSignedFinal,
+      takerAmount: takerAmountFinal,
       orderType: String(orderType || ''),
     },
   };
+}
+
+function hasValidApiCreds(creds) {
+  return Boolean(creds && creds.key && creds.secret && creds.passphrase);
+}
+
+function normalizeApiCreds(credsRaw) {
+  if (!credsRaw || typeof credsRaw !== 'object') return null;
+  const normalized = {
+    key: credsRaw.key || credsRaw.apiKey || '',
+    secret: credsRaw.secret || '',
+    passphrase: credsRaw.passphrase || '',
+  };
+  return hasValidApiCreds(normalized) ? normalized : null;
+}
+
+function isApiCredsExpired() {
+  return !hasValidApiCreds(apiCredsCache.creds) || Date.now() >= Number(apiCredsCache.expiresAtMs || 0);
+}
+
+function mapApiKeyCreateFailure(err) {
+  const mapped = normalizeClobErrorReason(err);
+  if (mapped.reason === 'api_key_create_failed') {
+    return {
+      status: mapped.upstreamStatus ?? 400,
+      data: { error: mapped.upstreamMessage || 'could not create api key' },
+    };
+  }
+  return {
+    status: mapped.upstreamStatus ?? 400,
+    data: { error: mapped.upstreamMessage || 'could not create api key' },
+  };
+}
+
+async function refreshClientApiCreds(client) {
+  const now = Date.now();
+  const ttlMs = Math.max(60_000, Number(ENV.POLY_API_CREDS_TTL_MS) || (55 * 60 * 1000));
+  if (!isApiCredsExpired()) {
+    client.creds = apiCredsCache.creds;
+    return apiCredsCache.creds;
+  }
+  if (!apiCredsCache.inFlightPromise) {
+    apiCredsCache.inFlightPromise = (async () => {
+      const maybeCreate = client.createOrDeriveApiKey || client.createApiKey || client.deriveApiKey;
+      if (typeof maybeCreate !== 'function') return null;
+      try {
+        const credsRaw = await maybeCreate.call(client);
+        const normalized = normalizeApiCreds(credsRaw);
+        if (!normalized) throw new Error('could not create api key');
+        apiCredsCache.creds = normalized;
+        apiCredsCache.createdAtMs = now;
+        apiCredsCache.expiresAtMs = now + ttlMs;
+        return normalized;
+      } catch (err) {
+        throw mapApiKeyCreateFailure(err);
+      } finally {
+        apiCredsCache.inFlightPromise = null;
+      }
+    })();
+  }
+  const creds = await apiCredsCache.inFlightPromise;
+  if (hasValidApiCreds(creds)) client.creds = creds;
+  return creds;
+}
+
+function shouldRefreshCredsFromMappedError(mapped) {
+  const msg = String(mapped?.upstreamMessage || '').toLowerCase();
+  const status = Number(mapped?.upstreamStatus ?? NaN);
+  if (Number.isFinite(status) && (status === 401 || status === 403)) return true;
+  if (mapped?.reason === 'api_key_create_failed') return true;
+  return msg.includes('api credentials') || msg.includes('unauthorized') || msg.includes('forbidden');
 }
 
 async function loadClobClient() {
@@ -978,16 +1093,12 @@ async function loadClobClient() {
     resolveSignatureType(),
     ENV.POLY_FUNDER_ADDRESS || undefined,
   );
-  const maybeCreate = client.createOrDeriveApiKey || client.createApiKey || client.deriveApiKey;
-  if (typeof maybeCreate === 'function') {
-    const credsRaw = await maybeCreate.call(client);
-    if (credsRaw && typeof credsRaw === 'object') {
-      const normalized = {
-        key: credsRaw.key || credsRaw.apiKey || '',
-        secret: credsRaw.secret || '',
-        passphrase: credsRaw.passphrase || '',
-      };
-      if (normalized.key && normalized.secret && normalized.passphrase) client.creds = normalized;
+  if (hasValidApiCreds(apiCredsCache.creds) && !isApiCredsExpired()) {
+    client.creds = apiCredsCache.creds;
+  } else {
+    const maybeCreate = client.createOrDeriveApiKey || client.createApiKey || client.deriveApiKey;
+    if (typeof maybeCreate === 'function') {
+      await refreshClientApiCreds(client);
     }
   }
   return { client, mod };
@@ -1157,38 +1268,7 @@ async function placeOrderViaClob({ direction, yesTokenId, noTokenId, clientOrder
     };
   }
 
-  const mod = await import('@polymarket/clob-client');
-  const walletMod = await import('@ethersproject/wallet');
-  const ClobClient = mod?.ClobClient || mod?.default?.ClobClient || mod?.default;
-  const Wallet = walletMod?.Wallet || walletMod?.default;
-  if (!ClobClient) {
-    throw new Error('clob_client_constructor_not_found');
-  }
-  if (!Wallet) {
-    throw new Error('ethers_wallet_constructor_not_found');
-  }
-
-  const signer = new Wallet(ENV.POLY_PRIVATE_KEY);
-  const client = new ClobClient(
-    ENV.POLY_CLOB_HOST,
-    137,
-    signer,
-    undefined,
-    resolveSignatureType(),
-    ENV.POLY_FUNDER_ADDRESS || undefined,
-  );
-  const maybeCreate = client.createOrDeriveApiKey || client.createApiKey || client.deriveApiKey;
-  if (typeof maybeCreate === 'function') {
-    const credsRaw = await maybeCreate.call(client);
-    if (credsRaw && typeof credsRaw === 'object') {
-      const normalized = {
-        key: credsRaw.key || credsRaw.apiKey || '',
-        secret: credsRaw.secret || '',
-        passphrase: credsRaw.passphrase || '',
-      };
-      if (normalized.key && normalized.secret && normalized.passphrase) client.creds = normalized;
-    }
-  }
+  const { client, mod } = await loadClobClient();
   const feeResolved = await resolveDynamicFeeRateBps(client, null, null);
   if (!Number.isInteger(feeResolved.feeRateBps)) {
     return {
@@ -1413,6 +1493,68 @@ async function placeOutcomeOrder({
         const { result, orderType, finalOrderRequest, precisionApplied } = posted;
         if (result?.error) {
           const mapped = normalizeClobErrorReason(result.error);
+          if (shouldRefreshCredsFromMappedError(mapped)) {
+            try {
+              await refreshClientApiCreds(client);
+              const retriedPosted = await postMarketOrderWithClient(client, mod, attemptOrderRequest, 'GTC');
+              if (!retriedPosted?.preflightFailed) {
+                const retriedResult = retriedPosted?.result;
+                if (!retriedResult?.error) {
+                  const retriedOrderId = extractOrderId(retriedResult);
+                  const retriedInitialStatus = normalizeOrderStatus(retriedResult);
+                  lastOrderId = retriedOrderId;
+                  lastStatus = retriedInitialStatus;
+                  if (retriedOrderId) {
+                    state.gtcOpenByToken[tokenId] = { orderId: retriedOrderId, bucketKey, decision };
+                  }
+                  if (retriedInitialStatus === 'FILLED') {
+                    delete state.gtcOpenByToken[tokenId];
+                    return {
+                      skipped: false,
+                      feeRateBpsUsed: feeRateBps,
+                      feeSource,
+                      feeRaw,
+                      orderType: 'GTC',
+                      bucketKey,
+                      attemptCount,
+                      ttlMs,
+                      orderId: retriedOrderId,
+                      status: 'FILLED',
+                      filled: true,
+                      orderRequest: sanitizeOrderRequest({ ...(retriedPosted.finalOrderRequest || attemptOrderRequest), orderType: 'GTC' }),
+                      precisionApplied: retriedPosted.precisionApplied,
+                      clobPayloadPosted: retriedPosted.clobPayloadPosted || null,
+                      ...(geo ? { geo } : {}),
+                      result: retriedResult,
+                      intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType: retriedPosted.orderType || orderType },
+                    };
+                  }
+                }
+              }
+            } catch (refreshErr) {
+              const refreshMapped = mapApiKeyCreateFailure(refreshErr);
+              return {
+                skipped: true,
+                reason: 'api_key_create_failed',
+                upstreamStatus: refreshMapped.upstreamStatus,
+                upstreamMessage: refreshMapped.upstreamMessage,
+                feeRateBpsUsed: feeRateBps,
+                feeSource,
+                feeRaw,
+                orderType: 'GTC',
+                bucketKey,
+                attemptCount,
+                ttlMs,
+                status: 'REJECTED',
+                orderRequest: sanitizeOrderRequest({ ...(finalOrderRequest || attemptOrderRequest), orderType: 'GTC' }),
+                precisionApplied,
+                clobPayloadPosted: posted.clobPayloadPosted || null,
+                ...(geo ? { geo } : {}),
+                intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+                result,
+              };
+            }
+          }
           return {
             skipped: true,
             reason: mapped.reason,
@@ -1520,7 +1662,14 @@ async function placeOutcomeOrder({
           status: lastStatus || 'OPEN',
           filled: false,
           orderRequest: sanitizeOrderRequest({ ...orderRequest, orderType: 'GTC' }),
-          precisionApplied: { makerDecimals: 4, takerDecimals: 2, makerWas: null, takerWas: orderRequest?.amount ?? null },
+          precisionApplied: {
+            makerDecimals: Math.max(0, Number(ENV.POLY_MAKER_DECIMALS) || 2),
+            takerDecimals: Math.max(0, Number(ENV.POLY_TAKER_DECIMALS) || 4),
+            makerWas: null,
+            takerWas: orderRequest?.amount ?? null,
+            makerFinal: floorToDecimals(orderRequest?.amount ?? 0, Math.max(0, Number(ENV.POLY_MAKER_DECIMALS) || 2)),
+            takerFinal: null,
+          },
           clobPayloadPosted: null,
           ...(geo ? { geo } : {}),
           intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
@@ -1541,7 +1690,14 @@ async function placeOutcomeOrder({
         status: lastStatus || 'CANCELED',
         filled: false,
         orderRequest: sanitizeOrderRequest({ ...orderRequest, orderType: 'GTC' }),
-        precisionApplied: { makerDecimals: 4, takerDecimals: 2, makerWas: null, takerWas: orderRequest?.amount ?? null },
+        precisionApplied: {
+          makerDecimals: Math.max(0, Number(ENV.POLY_MAKER_DECIMALS) || 2),
+          takerDecimals: Math.max(0, Number(ENV.POLY_TAKER_DECIMALS) || 4),
+          makerWas: null,
+          takerWas: orderRequest?.amount ?? null,
+          makerFinal: floorToDecimals(orderRequest?.amount ?? 0, Math.max(0, Number(ENV.POLY_MAKER_DECIMALS) || 2)),
+          takerFinal: null,
+        },
         clobPayloadPosted: null,
         ...(geo ? { geo } : {}),
         intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
@@ -1570,6 +1726,73 @@ async function placeOutcomeOrder({
     const { result, orderType, finalOrderRequest, precisionApplied } = posted;
     if (result?.error) {
       const mapped = normalizeClobErrorReason(result.error);
+      if (shouldRefreshCredsFromMappedError(mapped)) {
+        try {
+          await refreshClientApiCreds(client);
+          const retriedPosted = await postMarketOrderWithClient(client, mod, orderRequest, configuredOrderType);
+          if (!retriedPosted?.preflightFailed && !retriedPosted?.result?.error) {
+            return {
+              skipped: false,
+              feeRateBpsUsed: feeRateBps,
+              feeSource,
+              feeRaw,
+              orderType: configuredOrderType,
+              bucketKey,
+              attemptCount: 1,
+              ttlMs: null,
+              orderRequest: sanitizeOrderRequest({ ...(retriedPosted.finalOrderRequest || orderRequest), orderType: retriedPosted.orderType || configuredOrderType }),
+              precisionApplied: retriedPosted.precisionApplied,
+              clobPayloadPosted: retriedPosted.clobPayloadPosted || null,
+              ...(geo ? { geo } : {}),
+              result: retriedPosted.result,
+              intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice, orderType: retriedPosted.orderType || configuredOrderType },
+            };
+          }
+          if (retriedPosted?.result?.error) {
+            const mappedRetry = normalizeClobErrorReason(retriedPosted.result.error);
+            return {
+              skipped: true,
+              reason: mappedRetry.reason,
+              upstreamStatus: mappedRetry.upstreamStatus,
+              upstreamMessage: mappedRetry.upstreamMessage,
+              feeRateBpsUsed: feeRateBps,
+              feeSource,
+              feeRaw,
+              orderType: configuredOrderType,
+              bucketKey,
+              attemptCount: 1,
+              ttlMs: null,
+              orderRequest: sanitizeOrderRequest({ ...(retriedPosted.finalOrderRequest || orderRequest), orderType: retriedPosted.orderType || configuredOrderType }),
+              precisionApplied: retriedPosted.precisionApplied,
+              clobPayloadPosted: retriedPosted.clobPayloadPosted || null,
+              ...(geo ? { geo } : {}),
+              intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+              result: retriedPosted.result,
+            };
+          }
+        } catch (refreshErr) {
+          const refreshMapped = mapApiKeyCreateFailure(refreshErr);
+          return {
+            skipped: true,
+            reason: 'api_key_create_failed',
+            upstreamStatus: refreshMapped.upstreamStatus,
+            upstreamMessage: refreshMapped.upstreamMessage,
+            feeRateBpsUsed: feeRateBps,
+            feeSource,
+            feeRaw,
+            orderType: configuredOrderType,
+            bucketKey,
+            attemptCount: 1,
+            ttlMs: null,
+            orderRequest: sanitizeOrderRequest({ ...(finalOrderRequest || orderRequest), orderType }),
+            precisionApplied,
+            clobPayloadPosted: posted.clobPayloadPosted || null,
+            ...(geo ? { geo } : {}),
+            intent: { side: orderSide, tokenId, outcome, amountUsd: notionalUSD, clientOrderId, midPrice },
+            result,
+          };
+        }
+      }
       const requiredFeeBps = extractRequiredFeeBpsFromMessage(mapped.upstreamMessage);
       if (configuredOrderType === 'FOK' && mapped.reason === 'clob_error' && Number.isInteger(requiredFeeBps) && requiredFeeBps > 0) {
         const retryRequest = { ...orderRequest, feeRateBps: requiredFeeBps };
@@ -2091,6 +2314,9 @@ async function runExecute(body, requestRid) {
       orderType: resp?.orderType ?? null,
       attemptCount: Number.isFinite(resp?.attemptCount) ? resp.attemptCount : null,
       upstreamStatus: resp?.upstreamStatus ?? null,
+      makerAmountFinal: resp?.makerAmountFinal ?? null,
+      takerAmountFinal: resp?.takerAmountFinal ?? null,
+      precisionApplied: resp?.precisionApplied ?? null,
     });
   };
 
@@ -2358,7 +2584,14 @@ async function runExecute(body, requestRid) {
     : null;
   const precisionApplied = order?.precisionApplied && typeof order.precisionApplied === 'object'
     ? order.precisionApplied
-    : null;
+    : {
+      makerDecimals: Math.max(0, Number(ENV.POLY_MAKER_DECIMALS) || 2),
+      takerDecimals: Math.max(0, Number(ENV.POLY_TAKER_DECIMALS) || 4),
+      makerWas: orderRequest?.makerAmount ?? null,
+      takerWas: orderRequest?.takerAmount ?? orderRequest?.amount ?? null,
+      makerFinal: null,
+      takerFinal: null,
+    };
   const clobPayloadPosted = order?.clobPayloadPosted && typeof order.clobPayloadPosted === 'object'
     ? order.clobPayloadPosted
     : null;
@@ -2391,6 +2624,11 @@ async function runExecute(body, requestRid) {
     orderType,
     attemptCount,
     ttlMs,
+    precisionApplied: {
+      ...precisionApplied,
+      makerFinal: precisionApplied?.makerFinal ?? makerAmountFinal ?? null,
+      takerFinal: precisionApplied?.takerFinal ?? takerAmountFinal ?? null,
+    },
     voteSummary: quorum.voteSummary,
     ...(upstreamStatus ? { upstreamStatus } : {}),
     ...(upstreamMessage ? { upstreamMessage } : {}),
@@ -2398,7 +2636,7 @@ async function runExecute(body, requestRid) {
     ...(orderId ? { orderId } : {}),
     ...(order?.skipped ? { filled: false } : { filled }),
     ...(order.skipped && (reason === 'clob_error' || reason === 'fee_rate_unavailable' || reason === 'open_wait_fill_force_fill' || reason === 'amount_precision_preflight_failed') && orderRequest ? { orderRequest } : {}),
-    ...(order.skipped && (reason === 'clob_error' || reason === 'fee_rate_unavailable' || reason === 'open_wait_fill_force_fill' || reason === 'amount_precision_preflight_failed') && precisionApplied ? { precisionApplied } : {}),
+    ...(order.skipped && (reason === 'clob_error' || reason === 'fee_rate_unavailable' || reason === 'open_wait_fill_force_fill' || reason === 'amount_precision_preflight_failed') && orderRequest ? { orderRequestSanitized: orderRequest } : {}),
     ...(order.skipped && (reason === 'clob_error' || reason === 'fee_rate_unavailable' || reason === 'open_wait_fill_force_fill' || reason === 'amount_precision_preflight_failed') && clobPayloadPosted ? { clobPayloadPosted } : {}),
     ...(geo ? { geo: { blocked: Boolean(geo.blocked), country: geo.country || '', region: geo.region || '', ip: geo.ip || '' } } : {}),
     ...(!order.skipped ? { order } : {}),
