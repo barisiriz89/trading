@@ -542,6 +542,10 @@ function tickLog(line) {
   console.log(JSON.stringify(line));
 }
 
+function decisionLog(line) {
+  console.log('DECISION:', JSON.stringify(line));
+}
+
 async function runTick(reqRid) {
   const runRid = reqRid || rid();
   const ts = new Date().toISOString();
@@ -570,6 +574,7 @@ async function runTick(reqRid) {
     state.lastRun = result;
     await saveStateToDisk();
     tickLog({ ts, rid: runRid, slug: market.slug, yesTokenId: market.yesTokenId, votes: null, indicators: null, decision: 'FLAT', reason: 'not_enough_5m_candles', dryRun: ENV.POLY_DRY_RUN, killSwitch: ENV.POLY_KILL_SWITCH });
+    decisionLog({ ts, rid: runRid, marketSlug: market.slug, decision: 'FLAT', reason: 'not_enough_5m_candles', tokenId: null });
     return result;
   }
 
@@ -593,6 +598,7 @@ async function runTick(reqRid) {
     state.lastRun = result;
     await saveStateToDisk();
     tickLog({ ts, rid: runRid, slug: market.slug, yesTokenId: market.yesTokenId, votes: null, indicators: null, decision: 'FLAT', reason: 'no_closed_bar', dryRun: ENV.POLY_DRY_RUN, killSwitch: ENV.POLY_KILL_SWITCH });
+    decisionLog({ ts, rid: runRid, marketSlug: market.slug, decision: 'FLAT', reason: 'no_closed_bar', tokenId: null });
     return result;
   }
 
@@ -614,6 +620,7 @@ async function runTick(reqRid) {
     state.lastRun = result;
     await saveStateToDisk();
     tickLog({ ts, rid: runRid, slug: market.slug, yesTokenId: market.yesTokenId, votes: null, indicators: null, decision: 'FLAT', reason: evalOut.error, dryRun: ENV.POLY_DRY_RUN, killSwitch: ENV.POLY_KILL_SWITCH });
+    decisionLog({ ts, rid: runRid, marketSlug: market.slug, decision: 'FLAT', reason: evalOut.error, tokenId: null });
     return result;
   }
 
@@ -683,6 +690,14 @@ async function runTick(reqRid) {
     reason: finalReason,
     dryRun: ENV.POLY_DRY_RUN,
     killSwitch: ENV.POLY_KILL_SWITCH,
+  });
+  decisionLog({
+    ts,
+    rid: runRid,
+    marketSlug: market.slug,
+    decision,
+    reason: finalReason,
+    tokenId: decision === 'LONG' ? market.yesTokenId : decision === 'SHORT' ? market.noTokenId : null,
   });
 
   return result;

@@ -14,6 +14,7 @@
     "poly:test": "npm --workspace services/polymarket-bot run poly:test",
     "poly:smoke": "./scripts/poly_smoke.sh",
     "poly:deploy": "./scripts/poly_deploy.sh",
-    "poly:cloud-smoke": "./scripts/poly_cloud_smoke.sh"
+    "poly:cloud-smoke": "./scripts/poly_cloud_smoke.sh",
+    "poly:scheduler-smoke": "./scripts/poly_scheduler_smoke.sh"
   }
 }
